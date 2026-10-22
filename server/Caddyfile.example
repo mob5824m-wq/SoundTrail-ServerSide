@@ -1,0 +1,6 @@
+# Replace sync.example.net with a domain whose DNS points at this server.
+# Caddy and the sync API run on the same machine; the API listens on 127.0.0.1:8080.
+sync.example.net {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8080
+}

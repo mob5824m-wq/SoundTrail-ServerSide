@@ -1,0 +1,4 @@
+# Core, pure-Python dependencies for the optional YouTube audio endpoint.
+# The sync API itself uses only the Python standard library.
+# Pinned deliberately: update, then re-test extraction after upstream changes.
+yt-dlp[default]==2026.8.19

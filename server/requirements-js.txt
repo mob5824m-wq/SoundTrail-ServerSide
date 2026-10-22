@@ -1,0 +1,5 @@
+# Optional JavaScript runtime for yt-dlp's YouTube challenge solver.
+# Deno ships prebuilt wheels only for Linux x86_64/aarch64 (glibc), macOS x86_64/arm64
+# and Windows x86_64. On other platforms the installer skips it: install Deno or Node.js
+# yourself and make it available on PATH, and yt-dlp will detect it.
+deno==2.9.5
