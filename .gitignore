@@ -1,0 +1,11 @@
+# Python / self-hosted server
+__pycache__/
+*.py[cod]
+.venv/
+# Local sync database and managed backups (default location when SOUNDTRAIL_DB is unset)
+server/data/
+*.sqlite3
+*.sqlite3-*
+# OS / editor
+.DS_Store
+*.swp

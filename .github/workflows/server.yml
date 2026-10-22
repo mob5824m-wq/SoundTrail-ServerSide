@@ -1,0 +1,28 @@
+name: Server tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # The server documents Python 3.10+; exercise the minimum and current stable.
+        python-version: ['3.10', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      # The API test suite uses only the standard library and deliberately does not
+      # install the optional yt-dlp extraction dependencies.
+      - name: Run server API tests
+        run: python -m unittest discover -s server -v
