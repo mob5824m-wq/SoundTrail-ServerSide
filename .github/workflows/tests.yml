@@ -25,4 +25,4 @@ jobs:
       # The API test suite uses only the standard library and deliberately does not
       # install the optional yt-dlp extraction dependencies.
       - name: Run server API tests
-        run: python -m unittest discover -s server -v
+        run: python -m unittest discover -s . -v

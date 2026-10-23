@@ -13,7 +13,7 @@ from the command line for an immediate copy, a listing, a verification, or a res
     python3 backup.py restore NAME --yes
 
 Environment:
-    SOUNDTRAIL_DB          database file (default: server/data/soundtrail.sqlite3)
+    SOUNDTRAIL_DB          database file (default: data/soundtrail.sqlite3)
     SOUNDTRAIL_BACKUP_DIR  where snapshots go (default: <database folder>/backups)
     SOUNDTRAIL_BACKUP_KEEP how many to keep (default: 7)
 
@@ -318,7 +318,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Managed, verified backups for the Soundtrail sync server."
     )
-    parser.add_argument("--db", help="database file (default: SOUNDTRAIL_DB or server/data/soundtrail.sqlite3)")
+    parser.add_argument("--db", help="database file (default: SOUNDTRAIL_DB or data/soundtrail.sqlite3)")
     parser.add_argument("--backup-dir", help="snapshot folder (default: SOUNDTRAIL_BACKUP_DIR or <db folder>/backups)")
     parser.add_argument("--keep", type=int, default=_env_keep())
     subparsers = parser.add_subparsers(dest="command", required=True)
