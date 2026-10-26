@@ -4,8 +4,10 @@
 The sync API needs no downtime to make a consistent copy: SQLite's online backup API reads the
 live database (including committed WAL content) while the server keeps serving. Every snapshot is
 written next to the database, integrity-checked, given a SHA-256 sidecar, and pruned to a fixed
-number of versions. The server starts a backup thread automatically; the same code is available
-from the command line for an immediate copy, a listing, a verification, or a restore.
+number of versions. The server starts a backup thread automatically (reusing an existing snapshot that
+is newer than both the interval and the database files, so restart loops do not churn the retention
+window); the same code is available from the command line for an immediate copy, a listing, a
+verification, or a restore.
 
     python3 backup.py backup [--keep 7]
     python3 backup.py list
@@ -66,6 +68,22 @@ def _protect(path: Path, mode: int) -> None:
         os.chmod(path, mode)
     except OSError:
         pass
+
+
+def _sync_directory(path: Path) -> None:
+    """Best-effort fsync of a folder, so a rename is durable (POSIX only)."""
+    if os.name != "posix":
+        return
+    try:
+        handle = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(handle)
+    except OSError:
+        pass
+    finally:
+        os.close(handle)
 
 
 def _sha256(path: Path) -> str:
@@ -139,6 +157,7 @@ def create_backup(
         with temp.open("rb") as handle:
             os.fsync(handle.fileno())
         os.replace(temp, target)
+        _sync_directory(destination_dir)
         _protect(target, 0o600)
         _sidecar(target).write_text(_sha256(target) + "\n", encoding="ascii")
         _protect(_sidecar(target), 0o600)
@@ -260,10 +279,30 @@ def restore_backup(
         for side_file in (database.with_name(database.name + "-wal"), database.with_name(database.name + "-shm")):
             side_file.unlink(missing_ok=True)
         os.replace(temp, database)
+        _sync_directory(database.parent)
         _protect(database, 0o600)
     finally:
         temp.unlink(missing_ok=True)
     return database
+
+
+def backup_folder(db_path: Path | str | None, backup_dir: Path | str | None) -> Path:
+    """Where snapshots for this database live, without opening the database."""
+    if backup_dir:
+        return Path(backup_dir)
+    return default_backup_dir(Path(db_path) if db_path else default_db_path())
+
+
+def database_mtime(db_path: Path | str | None) -> float:
+    """Newest modification time of the database main file and its WAL side-files."""
+    database = Path(db_path) if db_path else default_db_path()
+    newest = 0.0
+    for path in (database, database.with_name(database.name + "-wal"), database.with_name(database.name + "-shm")):
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
 
 
 def backup_loop(
@@ -273,15 +312,38 @@ def backup_loop(
     interval_seconds: int,
     stop: threading.Event,
 ) -> None:
-    """Runs in a daemon thread beside the API; one snapshot at startup, then on the interval."""
+    """Runs in a daemon thread beside the API: one snapshot at startup, then on the interval.
+
+    A snapshot that is both newer than the interval and newer than every database file is reused
+    instead of being copied again: otherwise a restart loop, a redeploy, or a crash restart would
+    write another full copy each time and prune the retention window down to "the last few
+    restarts". A database that was recreated or written since the snapshot still gets a fresh one.
+    """
     if interval_seconds <= 0:
         return
+    first = True
     while not stop.is_set():
         try:
-            created = create_backup(db_path, backup_dir, keep=keep)
-            print(f"Managed backup written: {created}", flush=True)
+            existing = list_backups(backup_folder(db_path, backup_dir))
+            recent = False
+            if existing:
+                snapshot_time = float(existing[0]["modified"])
+                recent = (
+                    time.time() - snapshot_time < interval_seconds
+                    and snapshot_time >= database_mtime(db_path)
+                )
+            if first and recent:
+                print(
+                    f"Managed backup reused: {existing[0]['name']} is newer than the "
+                    f"{interval_seconds:g}s interval.",
+                    flush=True,
+                )
+            else:
+                created = create_backup(db_path, backup_dir, keep=keep)
+                print(f"Managed backup written: {created}", flush=True)
         except Exception as exc:  # noqa: BLE001 - a bad backup must not stop the API
             print(f"Managed backup failed: {type(exc).__name__}: {exc}", flush=True)
+        first = False
         if stop.wait(interval_seconds):
             return
 

@@ -44,15 +44,23 @@ The server is plain Python. It runs on Linux, macOS, Windows, and BSD, on x86-64
 
 5. Put a reverse proxy with TLS in front of it. The API listens on `127.0.0.1:8080` by default. Keep that loopback default and proxy to it, for example with [`Caddyfile.example`](Caddyfile.example) (Caddy runs on the same machine, so the upstream is `127.0.0.1:8080`). The example needs Caddy 2.5 or newer for `request_body`; it caps uploads at the edge and overwrites `X-Forwarded-For` with the proxy's own view of the client. Do not expose port 8080 directly.
 
-The SQLite database is created at `data/soundtrail.sqlite3`. Set `SOUNDTRAIL_DB` to store it elsewhere (for example on a dedicated disk).
+The SQLite database is created at `data/soundtrail.sqlite3`. Set `SOUNDTRAIL_DB` to store it elsewhere (for example on a dedicated disk). Schema changes are versioned in a `schema_meta` table and run once per database; startup work is skipped on later starts instead of rescanning the stored event log every time.
 
 ## Managed backups
 
 The service backs up its own database. A daemon thread takes a consistent copy through SQLite's
 online backup API at startup and then every 24 hours, verifies it with `PRAGMA integrity_check`,
-writes a SHA-256 sidecar, and deletes older snapshots beyond the retention count. Snapshot files
-are named `soundtrail-YYYYmmdd-HHMMSS-ffffff.sqlite3` and live in `<database folder>/backups` by
+writes a SHA-256 sidecar, and deletes older snapshots beyond the retention count. The snapshot and its
+rename into place are fsynced, so a crash just after a backup reports success cannot lose it. Snapshot
+files are named `soundtrail-YYYYmmdd-HHMMSS-ffffff.sqlite3` and live in `<database folder>/backups` by
 default.
+
+At startup the thread reuses an existing snapshot when it is already newer than the interval **and**
+newer than every database file, instead of writing another. Restarting the service repeatedly (a deploy
+loop, a crash loop, a reboot storm) would otherwise produce one full copy per restart and prune away the
+real history, keeping only the last few restarts under the retention count. A database that was written
+to or recreated after the snapshot still gets a fresh copy, so a restored or replaced database is never
+mistaken for a recent backup.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

@@ -47,6 +47,9 @@ REQUEST_TIMEOUT_SECONDS = 30
 # How long a stop request waits for requests already in progress before closing them.
 GRACEFUL_STOP_SECONDS = 10
 EXTRACTION_TMP_PREFIX = "soundtrail-youtube-"
+# Bumped when initialize_db has to change an existing database. Stored in schema_meta so a
+# migration runs once instead of on every start.
+SCHEMA_VERSION = 2
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 SESSION_SECONDS = 30 * 24 * 60 * 60
 PASSWORD_MIN_LENGTH = 10
@@ -114,6 +117,14 @@ def db_session(path: str):
         db.close()
 
 
+def _schema_version(db: sqlite3.Connection) -> int:
+    row = db.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+    try:
+        return int(row["value"]) if row else 1
+    except (TypeError, ValueError):
+        return 1
+
+
 def initialize_db(path: str) -> None:
     with db_session(path) as db:
         db.execute("PRAGMA journal_mode = WAL")
@@ -159,20 +170,36 @@ def initialize_db(path: str) -> None:
                 ciphertext TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
-        # Keep retry idempotency after old ciphertext rows are compacted away.
-        rows = db.execute("SELECT account_id, event_id, iv, ciphertext, sequence FROM sync_events").fetchall()
-        for row in rows:
+        version = _schema_version(db)
+        if version < 2:
+            # Retry receipts arrived after the first release. Rebuild them once from the events
+            # that are still stored: doing this on every start would re-read and re-hash the whole
+            # event log (potentially hundreds of megabytes) before the API can accept a request.
+            rows = db.execute(
+                "SELECT account_id, event_id, iv, ciphertext, sequence FROM sync_events"
+            ).fetchall()
+            for row in rows:
+                db.execute(
+                    "INSERT OR IGNORE INTO sync_event_receipts "
+                    "(account_id, event_id, iv_hash, ciphertext_hash, sequence) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        row["account_id"], row["event_id"],
+                        hashlib.sha256(row["iv"].encode("ascii")).digest(),
+                        hashlib.sha256(row["ciphertext"].encode("ascii")).digest(),
+                        int(row["sequence"]),
+                    ),
+                )
+        if version < SCHEMA_VERSION:
             db.execute(
-                "INSERT OR IGNORE INTO sync_event_receipts "
-                "(account_id, event_id, iv_hash, ciphertext_hash, sequence) VALUES (?, ?, ?, ?, ?)",
-                (
-                    row["account_id"], row["event_id"],
-                    hashlib.sha256(row["iv"].encode("ascii")).digest(),
-                    hashlib.sha256(row["ciphertext"].encode("ascii")).digest(),
-                    int(row["sequence"]),
-                ),
+                "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(SCHEMA_VERSION),),
             )
 
 

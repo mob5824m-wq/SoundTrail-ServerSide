@@ -424,6 +424,29 @@ class SyncApiTest(unittest.TestCase):
                 time.sleep(0.1)
         raise AssertionError("the server did not become healthy in time")
 
+    def test_retry_receipt_backfill_runs_once_per_database(self):
+        self.request("POST", "/v1/events", {"events": [self.encrypted_event(marker="kept")]}, self.account["token"])
+        # Rewind to a database written before receipts and the schema marker existed.
+        with app.db_session(self.db_path) as db:
+            db.execute("DELETE FROM sync_event_receipts")
+            db.execute("DELETE FROM schema_meta")
+
+        app.initialize_db(self.db_path)
+
+        with app.db_session(self.db_path) as db:
+            rebuilt = db.execute("SELECT COUNT(*) FROM sync_event_receipts").fetchone()[0]
+            version = db.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()[0]
+            self.assertEqual(1, rebuilt)
+            self.assertEqual(str(app.SCHEMA_VERSION), version)
+            # Starting again must not rescan and rewrite the receipt table; prove it by removing a
+            # receipt and checking that the next start leaves it removed.
+            db.execute("DELETE FROM sync_event_receipts")
+
+        app.initialize_db(self.db_path)
+
+        with app.db_session(self.db_path) as db:
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM sync_event_receipts").fetchone()[0])
+
     def test_health_is_public(self):
         status, data = self.request("GET", "/health")
         self.assertEqual(200, status)
