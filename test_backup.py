@@ -1,8 +1,11 @@
 """Tests for the managed, verified server backups (stdlib only, no network)."""
 from __future__ import annotations
 
+import os
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -120,6 +123,62 @@ class ManagedBackupTests(unittest.TestCase):
 
         self.assertEqual([row["name"] for row in listed], [second.name, first.name])
         self.assertEqual(backup.latest_backup(self.backups), second)
+
+    def test_backup_thread_reuses_a_snapshot_that_is_newer_than_the_interval(self) -> None:
+        existing = backup.create_backup(self.db, self.backups, keep=5)
+
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=backup.backup_loop, args=(self.db, self.backups, 5, 3600, stop), daemon=True
+        )
+        thread.start()
+        time.sleep(0.4)
+        stop.set()
+        thread.join(timeout=5)
+
+        # One snapshot already exists and is younger than the interval, so a restart must not
+        # write (and prune) a second copy.
+        self.assertEqual([row["name"] for row in backup.list_backups(self.backups)], [existing.name])
+
+    def test_backup_thread_snapshots_again_when_the_database_changed_since_the_last_copy(self) -> None:
+        existing = backup.create_backup(self.db, self.backups, keep=5)
+        # A write after the snapshot (or a recreated database) means the copy is stale even
+        # though it is younger than the interval.
+        self._add_marker("written after the snapshot")
+        # Make "later than the snapshot" unambiguous rather than relying on timestamp granularity.
+        later = existing.stat().st_mtime + 60
+        os.utime(self.db, (later, later))
+
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=backup.backup_loop, args=(self.db, self.backups, 5, 3600, stop), daemon=True
+        )
+        thread.start()
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and len(backup.list_backups(self.backups)) < 2:
+                time.sleep(0.05)
+            names = [row["name"] for row in backup.list_backups(self.backups)]
+            self.assertEqual(2, len(names), names)
+            self.assertEqual(existing.name, names[1])
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+    def test_backup_thread_writes_the_first_snapshot_when_none_exists(self) -> None:
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=backup.backup_loop, args=(self.db, self.backups, 5, 3600, stop), daemon=True
+        )
+        thread.start()
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not backup.list_backups(self.backups):
+                time.sleep(0.05)
+            self.assertEqual(1, len(backup.list_backups(self.backups)), "the startup snapshot was not written")
+        finally:
+            stop.set()
+            thread.join(timeout=5)
 
     def test_a_missing_database_is_an_error_not_an_empty_backup(self) -> None:
         with self.assertRaises(FileNotFoundError):

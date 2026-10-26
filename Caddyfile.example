@@ -1,6 +1,23 @@
 # Replace sync.example.net with a domain whose DNS points at this server.
 # Caddy and the sync API run on the same machine; the API listens on 127.0.0.1:8080.
 sync.example.net {
-    encode zstd gzip
-    reverse_proxy 127.0.0.1:8080
+	encode zstd gzip
+
+	# TLS-only: tell browsers never to try plain HTTP for this host again. Only add
+	# `includeSubDomains`/`preload` when every subdomain is HTTPS too, and drop this line
+	# entirely if the host must also answer on HTTP for some client.
+	header Strict-Transport-Security "max-age=31536000"
+
+	# Refuse oversized uploads at the edge. The API accepts at most 16 MiB of JSON per
+	# request (8 MiB of that for a snapshot), so this only rejects bodies it would reject too.
+	request_body {
+		max_size 17MB
+	}
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Give the API exactly one client address: Caddy's own view of the peer. The API
+		# trusts X-Forwarded-For only from a loopback/private peer, and this overwrites any
+		# header a client sent instead of appending to it.
+		header_up X-Forwarded-For {remote_host}
+	}
 }
