@@ -20,7 +20,7 @@ The separate YouTube audio endpoint is **not end-to-end encrypted**: when used, 
 
 Keep the machine, database volume, TLS proxy, backups, logs, and `/tmp` storage secured. The database has a **64 MiB per-account quota** for encrypted sync events and checkpoints. Event rows are pruned into an encrypted client checkpoint after sync; retry-receipt metadata is also pruned at that point. Old delivery IDs may therefore be accepted again after compaction, but encrypted entity clocks and tombstones make duplicate old versions harmless. Snapshots are limited to 8 MiB.
 
-The server applies in-process sliding-window limits to account creation, login, sync reads/writes, checkpoints, account deletion, and extraction; extraction also has a two-job concurrency cap. Current defaults are 5 account creations/hour/IP, 20 logins/minute/IP, 600 sync reads and writes/minute/IP, 10 checkpoints/minute/IP, 5 account deletions/hour/IP, and 30 extraction requests/minute/IP plus 20/minute/account. In-process limits reset on restart and are per instance, so keep the API behind a reverse proxy with its own request/body limits and rate limiting, especially if you run multiple workers. Each connection is also limited to 30 seconds of inactivity: a client that opens a request and stalls while sending its body gets `408 Request Timeout` and the socket is closed, so slow clients cannot hold worker threads open. Normal requests are small and complete far sooner; a very slow link uploading an 8 MiB snapshot may need a proxy with a larger upstream timeout. The app trusts `X-Forwarded-For` only when its direct peer is private/loopback; configure the proxy to overwrite or sanitize client-supplied forwarding headers before passing them upstream. There is no email verification or password-reset service. An authenticated account-deletion endpoint is available.
+The server applies in-process sliding-window limits to account creation, login, sync reads/writes, checkpoints, account deletion, and extraction; extraction also has a two-job concurrency cap. Current defaults are 5 account creations/hour/IP, 20 logins/minute/IP, 600 sync reads and writes/minute/IP, 10 checkpoints/minute/IP, 5 account deletions/hour/IP, and 30 extraction requests/minute/IP plus 20/minute/account. In-process limits reset on restart and are per instance, so keep the API behind a reverse proxy with its own request/body limits and rate limiting, especially if you run multiple workers. Each connection is also limited to 30 seconds of inactivity: a client that opens a request and stalls while sending its body gets `408 Request Timeout` and the socket is closed, so slow clients cannot hold worker threads open. Normal requests are small and complete far sooner; a very slow link uploading an 8 MiB snapshot may need a proxy with a larger upstream timeout. The app trusts `X-Forwarded-For` only when its direct peer is private/loopback; configure the proxy to overwrite or sanitize client-supplied forwarding headers before passing them upstream. Sign-in failures are also tracked per submitted address (10 failures in 15 minutes locks that address for 15 minutes, returning `429` with `Retry-After`), keyed on the address even when no account exists so the lockout cannot be used to discover which addresses are registered. The IP limits alone cannot stop a distributed attempt against one account. There is no email verification or password-reset service. An authenticated account-deletion endpoint is available.
 
 ## Run natively (no Docker, any OS and CPU)
 
@@ -195,7 +195,7 @@ Update the pins deliberately, then re-test extraction after upstream changes.
 - `POST /snapshots` — stores a client-encrypted full-state checkpoint through a server cursor, then prunes covered event rows.
 - `POST /youtube/audio` — authenticated JSON `{ "videoId": "…", "authorized": true }`; after the user's rights confirmation, returns a raw audio-only file. Only one YouTube video ID is accepted; playlists and video downloads are not supported.
 
-Each account's cursor is independent and every sync read/write is scoped to that account. Checkpoints are encrypted and authenticated by the client; the server cannot inspect their contents. Event delivery is idempotent until a checkpoint compacts the corresponding receipt metadata. Passwords are stored as per-account salted scrypt hashes; random session tokens expire after 30 days and are stored server-side only as SHA-256 hashes.
+Each account's cursor is independent and every sync read/write is scoped to that account. Checkpoints are encrypted and authenticated by the client; the server cannot inspect their contents. Event delivery is idempotent until a checkpoint compacts the corresponding receipt metadata. Passwords are stored as per-account salted scrypt hashes (`scrypt$32768$8$1$32` by default: 32 MiB and roughly 0.1 s per hash, so 128 MiB peak across the four hashes allowed at once); the work factor is recorded per account, so raising it applies to existing accounts at their next successful login instead of locking anyone out. Random session tokens expire after 30 days and are stored server-side only as SHA-256 hashes. Responses carry `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, a `default-src 'none'` content policy, and `Cache-Control: no-store`.
 
 ## Configuration
 
@@ -205,10 +205,18 @@ Each account's cursor is independent and every sync read/write is scoped to that
 - `SOUNDTRAIL_BACKUP_DIR` — snapshot folder (default `<database folder>/backups`).
 - `SOUNDTRAIL_BACKUP_INTERVAL_SECONDS` — seconds between automatic snapshots (default `86400`; `0` disables the background thread).
 - `SOUNDTRAIL_BACKUP_KEEP` — snapshots retained after a successful backup (default `7`).
+- `SOUNDTRAIL_PASSWORD_KDF_LOG2` — scrypt work factor for new passwords, as log2(N) (default `15`, clamped to `12`–`17`). Each step doubles the memory and time per hash: 2^15 is 32 MiB and about 0.1 s, 2^17 is 128 MiB and about 0.4 s. Existing accounts keep their recorded factor and are upgraded on next login.
+- `SOUNDTRAIL_PASSWORD_KDF_CONCURRENCY` — how many password hashes may run at once (default `4`, clamped to `1`–`8`). This bounds peak memory: `4 × 32 MiB = 128 MiB` at the default work factor. The startup log prints both the scheme and the peak.
 
 The API intentionally has no password-reset or key-recovery endpoint. If a user loses their 256-bit recovery key, resetting the account password cannot recover encrypted content. Account deletion removes remote encrypted data; it does not erase the user's local device library. If the database is lost, only a database backup can restore the encrypted event log and checkpoints.
 
 ## Security
+
+The database, its WAL side-files, and a database folder the service creates itself are tightened to
+`0600`/`0700` on startup and on every connection (POSIX), because SQLite otherwise creates them
+world-readable under a typical umask and they hold email addresses and password hashes. Snapshots are
+written `0600` into a `0700` folder. If you point `SOUNDTRAIL_DB` at a folder that already exists, it is
+left alone — check its mode yourself.
 
 Deploy this only on infrastructure you control, behind the TLS proxy described above, and keep the
 database, backup folder, logs, and `/tmp` readable only by the service user. The service never needs
@@ -218,8 +226,15 @@ connection except to YouTube for the optional audio endpoint.
 
 Before exposing an instance, check that: the API is bound to loopback and not reachable directly; the
 proxy terminates TLS and caps request bodies; the host firewall allows 443 only; backups are copied
-off-host; `yt-dlp`/Deno pins are updated deliberately and extraction is re-tested afterwards; and the
-account-deletion and login rate limits fit your expected traffic.
+off-host; `yt-dlp`/Deno pins are updated deliberately and extraction is re-tested afterwards; the
+account-deletion and login rate limits fit your expected traffic; and the password work factor fits the
+server's memory (see `SOUNDTRAIL_PASSWORD_KDF_*` above).
+
+Known limits, stated plainly: a self-hosted server sees who syncs when, and a malicious server can
+withhold or replay ciphertext — end-to-end encryption protects content, not availability or metadata.
+The client is responsible for rejecting rolled-back snapshots and for treating deletions as its own
+decision rather than trusting the server's absence of an event. Login lockout and rate limits are
+in-process constants, so they reset on restart and are per instance.
 
 To report a vulnerability, do **not** open a public issue. Use GitHub's private
 [security advisory](https://github.com/mob5824m-wq/SoundTrail-ServerSide/security/advisories/new) form

@@ -49,11 +49,25 @@ GRACEFUL_STOP_SECONDS = 10
 EXTRACTION_TMP_PREFIX = "soundtrail-youtube-"
 # Bumped when initialize_db has to change an existing database. Stored in schema_meta so a
 # migration runs once instead of on every start.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 SESSION_SECONDS = 30 * 24 * 60 * 60
 PASSWORD_MIN_LENGTH = 10
 PASSWORD_MAX_LENGTH = 128
+# scrypt work factor for new passwords, as log2(N). Each hash needs 128*R*N bytes, so the default
+# of 15 costs 32 MiB and ~100 ms; PASSWORD_KDF_CONCURRENCY caps how many run at once, which bounds
+# peak memory. Accounts hashed by an older release keep working and are upgraded on next login.
+PASSWORD_KDF_LOG2 = 15
+PASSWORD_KDF_R = 8
+PASSWORD_KDF_P = 1
+PASSWORD_KDF_DKLEN = 32
+PASSWORD_KDF_CONCURRENCY = 4
+LEGACY_PASSWORD_KDF_LOG2 = 14
+# Failed sign-ins per identifier before a short lockout. Keyed on the submitted address whether or
+# not the account exists, so the response cannot be used to discover which addresses are real.
+LOGIN_MAX_FAILURES = 10
+LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
+LOGIN_LOCKOUT_SECONDS = 15 * 60
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 BASE64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -97,13 +111,93 @@ class RateLimiter:
             return True
 
 
+class LoginThrottle:
+    """Short lockout after repeated failed sign-ins, keyed on the submitted address.
+
+    The IP limit in RateLimiter cannot stop a distributed attempt against one account, and this is
+    keyed on the address even when no account exists, so a locked and an unknown address look the
+    same. In-process, like the rest of the limits: it resets on restart.
+    """
+
+    def __init__(
+        self,
+        max_failures: int = LOGIN_MAX_FAILURES,
+        window_seconds: int = LOGIN_FAILURE_WINDOW_SECONDS,
+        lockout_seconds: int = LOGIN_LOCKOUT_SECONDS,
+    ) -> None:
+        self.max_failures = max_failures
+        self.window_seconds = window_seconds
+        self.lockout_seconds = lockout_seconds
+        self._failures: dict[str, deque[float]] = defaultdict(deque)
+        self._locked_until: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def locked_for(self, key: str) -> int:
+        """Seconds the identifier is still locked for, or 0."""
+        now = time.monotonic()
+        with self._lock:
+            until = self._locked_until.get(key)
+            if not until:
+                return 0
+            if until <= now:
+                self._locked_until.pop(key, None)
+                return 0
+            return int(until - now) + 1
+
+    def record_failure(self, key: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            attempts = self._failures[key]
+            cutoff = now - self.window_seconds
+            while attempts and attempts[0] <= cutoff:
+                attempts.popleft()
+            attempts.append(now)
+            if len(attempts) >= self.max_failures:
+                self._locked_until[key] = now + self.lockout_seconds
+                attempts.clear()
+            if len(self._failures) > 4096:
+                for item in [k for k, v in self._failures.items() if not v]:
+                    self._failures.pop(item, None)
+
+    def record_success(self, key: str) -> None:
+        with self._lock:
+            self._failures.pop(key, None)
+            self._locked_until.pop(key, None)
+
+
 from contextlib import contextmanager
+
+
+def _restrict(path: Path, mode: int) -> None:
+    """Best-effort permissions; Windows has no group/other bits to set."""
+    if os.name != "posix":
+        return
+    try:
+        if path.stat().st_mode & 0o777 != mode:
+            os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def _harden_database_files(path: str) -> None:
+    """The database holds emails and password hashes: keep it, and its WAL side-files, owner-only.
+
+    SQLite creates new files with the process umask, which on many systems leaves the database
+    world-readable. It also copies the main file's mode to new -wal/-shm files, so fixing the
+    database once is enough for the side-files it creates later.
+    """
+    for suffix in ("", "-wal", "-shm"):
+        _restrict(Path(path + suffix), 0o600)
 
 
 @contextmanager
 def db_session(path: str):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    parent = Path(path).parent
+    if not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+        _restrict(parent, 0o700)
     db = sqlite3.connect(path, timeout=15)
+    _harden_database_files(path)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
     db.execute("PRAGMA busy_timeout = 15000")
@@ -115,6 +209,10 @@ def db_session(path: str):
         raise
     finally:
         db.close()
+
+
+def _has_column(db: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(str(row["name"]) == column for row in db.execute(f"PRAGMA table_info({table})"))
 
 
 def _schema_version(db: sqlite3.Connection) -> int:
@@ -135,6 +233,7 @@ def initialize_db(path: str) -> None:
                 email TEXT NOT NULL UNIQUE,
                 password_salt BLOB NOT NULL,
                 password_hash BLOB NOT NULL,
+                password_scheme TEXT,
                 created_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS sessions (
@@ -195,20 +294,81 @@ def initialize_db(path: str) -> None:
                         int(row["sequence"]),
                     ),
                 )
+        if version < 3:
+            # Accounts written before password schemes were recorded are compared with the old
+            # work factor and re-hashed with the current one after their next successful login.
+            if not _has_column(db, "accounts", "password_scheme"):
+                db.execute("ALTER TABLE accounts ADD COLUMN password_scheme TEXT")
         if version < SCHEMA_VERSION:
             db.execute(
                 "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (str(SCHEMA_VERSION),),
             )
+    # WAL and its shared-memory file are created on first use; tighten them too.
+    _harden_database_files(path)
 
 
 def _password_bytes(password: str) -> bytes:
     return password.encode("utf-8")
 
 
-def password_digest(password: str, salt: bytes) -> bytes:
-    return hashlib.scrypt(_password_bytes(password), salt=salt, n=1 << 14, r=8, p=1, dklen=32)
+# Hashing is deliberately memory-expensive, so only a few run at once: without this cap, parallel
+# login attempts could allocate gigabytes and take the process down.
+_kdf_slots = threading.BoundedSemaphore(PASSWORD_KDF_CONCURRENCY)
+
+
+def configure_password_kdf(log2_n: int | None = None, concurrency: int | None = None) -> str:
+    """Apply operator overrides, clamped to sane bounds, and return the resulting scheme."""
+    global PASSWORD_KDF_LOG2, PASSWORD_KDF_CONCURRENCY, _kdf_slots
+    # Upper bounds keep a misconfiguration from turning sign-in into a memory bomb: 2^17 is
+    # 128 MiB per hash, and eight at once is still a whole gigabyte.
+    if log2_n is not None:
+        PASSWORD_KDF_LOG2 = min(max(int(log2_n), 12), 17)
+    if concurrency is not None:
+        PASSWORD_KDF_CONCURRENCY = min(max(int(concurrency), 1), 8)
+    _kdf_slots = threading.BoundedSemaphore(PASSWORD_KDF_CONCURRENCY)
+    return password_scheme()
+
+
+def password_memory_mib() -> int:
+    """Approximate peak memory for hashing, in MiB (per hash, and across the concurrency cap)."""
+    per_hash = 128 * PASSWORD_KDF_R * (1 << PASSWORD_KDF_LOG2)
+    return per_hash * PASSWORD_KDF_CONCURRENCY // (1024 * 1024)
+
+
+def password_scheme(log2_n: int | None = None) -> str:
+    """The stored description of how a password was hashed, e.g. `scrypt$32768$8$1$32`."""
+    log2_n = PASSWORD_KDF_LOG2 if log2_n is None else log2_n
+    return f"scrypt${1 << log2_n}${PASSWORD_KDF_R}${PASSWORD_KDF_P}${PASSWORD_KDF_DKLEN}"
+
+
+LEGACY_PASSWORD_SCHEME = password_scheme(LEGACY_PASSWORD_KDF_LOG2)
+
+
+def _parse_scheme(scheme: str | None) -> tuple[int, int, int, int]:
+    """(log2_n, r, p, dklen) from a stored scheme; unknown values fall back to the legacy one."""
+    if not scheme:
+        return (LEGACY_PASSWORD_KDF_LOG2, PASSWORD_KDF_R, PASSWORD_KDF_P, PASSWORD_KDF_DKLEN)
+    parts = scheme.split("$")
+    try:
+        algorithm, n, r, p, dklen = parts
+        n, r, p, dklen = int(n), int(r), int(p), int(dklen)
+    except (ValueError, TypeError):
+        return (LEGACY_PASSWORD_KDF_LOG2, PASSWORD_KDF_R, PASSWORD_KDF_P, PASSWORD_KDF_DKLEN)
+    # Clamp before hashing: a corrupted or edited row must not become a memory bomb.
+    if algorithm != "scrypt" or not (1 << 12) <= n <= (1 << 20) or not 1 <= r <= 32 or not 1 <= p <= 16:
+        return (LEGACY_PASSWORD_KDF_LOG2, PASSWORD_KDF_R, PASSWORD_KDF_P, PASSWORD_KDF_DKLEN)
+    return (n.bit_length() - 1, r, p, min(max(dklen, 16), 64))
+
+
+def password_digest(password: str, salt: bytes, scheme: str | None = None) -> bytes:
+    log2_n, r, p, dklen = _parse_scheme(scheme if scheme else password_scheme())
+    n = 1 << log2_n
+    # OpenSSL's default cap (32 MiB) is below what these parameters need, so state it explicitly.
+    maxmem = max(64 * 1024 * 1024, 2 * 128 * r * n)
+    with _kdf_slots:
+        return hashlib.scrypt(_password_bytes(password), salt=salt, n=n, r=r, p=p, dklen=dklen, maxmem=maxmem)
 
 
 def _validate_email(raw: Any) -> str:
@@ -245,12 +405,14 @@ def create_account(db_path: str, raw_email: Any, raw_password: Any) -> dict[str,
     now = int(time.time())
     account_id = str(uuid.uuid4())
     salt = secrets.token_bytes(16)
-    digest = password_digest(password, salt)
+    scheme = password_scheme()
+    digest = password_digest(password, salt, scheme)
     try:
         with db_session(db_path) as db:
             db.execute(
-                "INSERT INTO accounts(id, email, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-                (account_id, email, salt, digest, now),
+                "INSERT INTO accounts(id, email, password_salt, password_hash, password_scheme, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (account_id, email, salt, digest, scheme, now),
             )
             token, expires = _issue_session(db, account_id, now)
     except sqlite3.IntegrityError as exc:
@@ -265,13 +427,25 @@ def login(db_path: str, raw_email: Any, raw_password: Any) -> dict[str, Any]:
     now = int(time.time())
     with db_session(db_path) as db:
         row = db.execute(
-            "SELECT id, password_salt, password_hash FROM accounts WHERE email = ?", (email,)
+            "SELECT id, password_salt, password_hash, password_scheme FROM accounts WHERE email = ?",
+            (email,),
         ).fetchone()
         # Perform a scrypt even for a missing account, to reduce email enumeration by timing.
         salt = bytes(row["password_salt"]) if row else bytes(16)
-        actual = password_digest(raw_password, salt)
+        stored_scheme = (row["password_scheme"] if row else None) or LEGACY_PASSWORD_SCHEME
+        actual = password_digest(raw_password, salt, stored_scheme)
         if row is None or not hmac.compare_digest(actual, bytes(row["password_hash"])):
             raise ValueError("Email or password is incorrect.")
+        if stored_scheme != password_scheme():
+            # The account was created under a weaker work factor: upgrade it now that the correct
+            # password is known. Costs one extra hash per account, once.
+            upgraded_salt = secrets.token_bytes(16)
+            upgraded_scheme = password_scheme()
+            db.execute(
+                "UPDATE accounts SET password_salt = ?, password_hash = ?, password_scheme = ? WHERE id = ?",
+                (upgraded_salt, password_digest(raw_password, upgraded_salt, upgraded_scheme),
+                 upgraded_scheme, row["id"]),
+            )
         token, expires = _issue_session(db, row["id"], now)
     return {"accountId": row["id"], "email": email, "token": token, "expiresAt": expires}
 
@@ -619,6 +793,7 @@ def clean_stale_extraction_dirs(max_age_seconds: int = 3600, root: Path | None =
 
 def make_handler(db_path: str):
     limiter = RateLimiter()
+    login_throttle = LoginThrottle()
     youtube_slots = threading.BoundedSemaphore(2)
 
     class Handler(BaseHTTPRequestHandler):
@@ -641,6 +816,10 @@ def make_handler(db_path: str):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            # These are JSON documents, never pages: forbid embedding, framing, or subresources.
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
             for name, value in (extra_headers or {}).items():
                 self.send_header(name, value)
             self.end_headers()
@@ -664,6 +843,9 @@ def make_handler(db_path: str):
                 parsed = json.loads(body)
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 raise ValueError("Request body must be valid JSON.") from exc
+            except RecursionError as exc:
+                # Deeply nested arrays would otherwise unwind as a server error.
+                raise ValueError("Request body is nested too deeply.") from exc
             if not isinstance(parsed, dict):
                 raise ValueError("Request body must be a JSON object.")
             return parsed
@@ -818,7 +1000,24 @@ def make_handler(db_path: str):
                     result = create_account(db_path, body.get("email"), body.get("password"))
                     self._send(201, result)
                 elif parsed.path == "/v1/sessions":
-                    result = login(db_path, body.get("email"), body.get("password"))
+                    # Normalise the key like login() does, so case and spacing cannot dodge the lock.
+                    raw_email = body.get("email")
+                    throttle_key = raw_email.strip().lower() if isinstance(raw_email, str) else ""
+                    locked = login_throttle.locked_for(throttle_key)
+                    if locked:
+                        self._send(
+                            429,
+                            {"error": "Too many failed sign-in attempts. Try again shortly."},
+                            {"Retry-After": str(locked)},
+                        )
+                        return
+                    try:
+                        result = login(db_path, raw_email, body.get("password"))
+                    except ValueError as exc:
+                        if str(exc) == "Email or password is incorrect.":
+                            login_throttle.record_failure(throttle_key)
+                        raise
+                    login_throttle.record_success(throttle_key)
                     self._send(200, result)
                 elif parsed.path == "/v1/events":
                     assert auth is not None
@@ -899,6 +1098,10 @@ def serve() -> None:
     db_path = os.environ.get("SOUNDTRAIL_DB") or str(DEFAULT_DB_PATH)
     host = os.environ.get("SOUNDTRAIL_HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8080"))
+    scheme = configure_password_kdf(
+        _env_int("SOUNDTRAIL_PASSWORD_KDF_LOG2", PASSWORD_KDF_LOG2),
+        _env_int("SOUNDTRAIL_PASSWORD_KDF_CONCURRENCY", PASSWORD_KDF_CONCURRENCY),
+    )
     initialize_db(db_path)
 
     # Per-request extraction folders are deleted when the request ends; sweep any left by a
@@ -945,6 +1148,12 @@ def serve() -> None:
             # Not the main thread, or the platform has no such signal; Ctrl-C still works.
             pass
 
+    print(
+        f"Password hashing: {scheme} "
+        f"({128 * PASSWORD_KDF_R * (1 << PASSWORD_KDF_LOG2) // (1024 * 1024)} MiB per hash, "
+        f"at most {password_memory_mib()} MiB in parallel).",
+        flush=True,
+    )
     print(f"Soundtrail encrypted-sync API listening on {host}:{port}; database={db_path}")
     if backup_interval > 0:
         folder = managed_backups.default_backup_dir(Path(db_path))

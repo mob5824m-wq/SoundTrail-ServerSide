@@ -3,6 +3,11 @@
 sync.example.net {
 	encode zstd gzip
 
+	# TLS-only: tell browsers never to try plain HTTP for this host again. Only add
+	# `includeSubDomains`/`preload` when every subdomain is HTTPS too, and drop this line
+	# entirely if the host must also answer on HTTP for some client.
+	header Strict-Transport-Security "max-age=31536000"
+
 	# Refuse oversized uploads at the edge. The API accepts at most 16 MiB of JSON per
 	# request (8 MiB of that for a snapshot), so this only rejects bodies it would reject too.
 	request_body {

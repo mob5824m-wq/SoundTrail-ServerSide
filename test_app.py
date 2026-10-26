@@ -447,6 +447,139 @@ class SyncApiTest(unittest.TestCase):
         with app.db_session(self.db_path) as db:
             self.assertEqual(0, db.execute("SELECT COUNT(*) FROM sync_event_receipts").fetchone()[0])
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits only")
+    def test_database_and_its_folder_are_owner_only(self):
+        root = Path(self.temp.name) / "private" / "data"
+        db_path = root / "soundtrail.sqlite3"
+        app.initialize_db(str(db_path))
+        app.create_account(str(db_path), "perms@example.net", "correct horse battery")
+
+        self.assertEqual(0o700, root.stat().st_mode & 0o777)
+        self.assertEqual(0o600, db_path.stat().st_mode & 0o777)
+
+    def test_a_password_hashed_with_the_old_work_factor_is_upgraded_on_login(self):
+        legacy_salt = b"0123456789abcdef"
+        legacy_hash = app.password_digest("correct horse battery", legacy_salt, app.LEGACY_PASSWORD_SCHEME)
+        with app.db_session(self.db_path) as db:
+            db.execute(
+                "UPDATE accounts SET password_salt = ?, password_hash = ?, password_scheme = ?",
+                (legacy_salt, legacy_hash, app.LEGACY_PASSWORD_SCHEME),
+            )
+
+        status, session = self.request(
+            "POST", "/v1/sessions", {"email": "music@example.net", "password": "correct horse battery"}
+        )
+
+        self.assertEqual(200, status)
+        with app.db_session(self.db_path) as db:
+            row = db.execute(
+                "SELECT password_salt, password_hash, password_scheme FROM accounts WHERE id = ?",
+                (session["accountId"],),
+            ).fetchone()
+        self.assertEqual(app.password_scheme(), row["password_scheme"])
+        self.assertNotEqual(bytes(legacy_salt), bytes(row["password_salt"]))
+        self.assertEqual(
+            app.password_digest("correct horse battery", bytes(row["password_salt"]), row["password_scheme"]),
+            bytes(row["password_hash"]),
+        )
+        # The upgraded hash still authenticates.
+        self.assertEqual(
+            200,
+            self.request("POST", "/v1/sessions", {"email": "music@example.net", "password": "correct horse battery"})[0],
+        )
+
+    def test_repeated_failed_logins_lock_the_address_even_for_unknown_accounts(self):
+        for index in range(app.LOGIN_MAX_FAILURES):
+            status, body = self.request(
+                "POST", "/v1/sessions", {"email": "music@example.net", "password": f"wrong password {index}"}
+            )
+            self.assertEqual(401, status, body)
+
+        status, body = self.request(
+            "POST", "/v1/sessions", {"email": "MUSIC@example.net", "password": "correct horse battery"}
+        )
+        self.assertEqual(429, status)
+        self.assertIn("Too many failed", body["error"])
+
+
+    def test_the_lockout_applies_to_unknown_addresses_the_same_way(self):
+        # An address with no account must lock identically, so the lockout cannot be used to
+        # discover which addresses have accounts.
+        for index in range(app.LOGIN_MAX_FAILURES):
+            status, _ = self.request(
+                "POST", "/v1/sessions", {"email": "nobody@example.net", "password": f"wrong password {index}"}
+            )
+            self.assertEqual(401, status)
+        status, body = self.request(
+            "POST", "/v1/sessions", {"email": "nobody@example.net", "password": "wrong password"}
+        )
+        self.assertEqual(429, status)
+        self.assertIn("Too many failed", body["error"])
+
+    def test_deeply_nested_json_is_rejected_without_failing_the_server(self):
+        with socket.create_connection(("127.0.0.1", self.httpd.server_address[1]), timeout=10) as client:
+            body = b"[" * 100_000
+            client.sendall(
+                b"POST /v1/accounts HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                + body
+            )
+            response = b""
+            while True:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        self.assertIn(b" 400 ", response.split(b"\r\n", 1)[0])
+        # The server is still healthy afterwards.
+        self.assertEqual(200, self.request("GET", "/health")[0])
+
+    def test_responses_carry_hardening_headers(self):
+        with urllib.request.urlopen(self.base + "/health", timeout=5) as response:
+            self.assertEqual("DENY", response.headers["X-Frame-Options"])
+            self.assertEqual("no-referrer", response.headers["Referrer-Policy"])
+            self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
+            self.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
+            self.assertEqual("no-store", response.headers["Cache-Control"])
+
+    def test_old_databases_gain_the_password_scheme_column_and_keep_working(self):
+        legacy_salt = b"0123456789abcdef"
+        legacy_hash = app.password_digest("correct horse battery", legacy_salt, app.LEGACY_PASSWORD_SCHEME)
+        with app.db_session(self.db_path) as db:
+            # Reproduce a database written by an older release: no scheme column, version 2.
+            db.execute("ALTER TABLE accounts DROP COLUMN password_scheme")
+            db.execute(
+                "UPDATE accounts SET password_salt = ?, password_hash = ?", (legacy_salt, legacy_hash)
+            )
+            db.execute("UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'")
+
+        app.initialize_db(self.db_path)
+
+        with app.db_session(self.db_path) as db:
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(accounts)")}
+            self.assertIn("password_scheme", columns)
+            self.assertEqual(
+                str(app.SCHEMA_VERSION),
+                db.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()[0],
+            )
+        self.assertEqual(
+            200,
+            self.request("POST", "/v1/sessions", {"email": "music@example.net", "password": "correct horse battery"})[0],
+        )
+
+    def test_work_factor_overrides_are_clamped_and_still_hash(self):
+        saved = (app.PASSWORD_KDF_LOG2, app.PASSWORD_KDF_CONCURRENCY)
+        try:
+            self.assertEqual("scrypt$4096$8$1$32", app.configure_password_kdf(1, 0))
+            self.assertGreaterEqual(app.PASSWORD_KDF_CONCURRENCY, 1)
+            self.assertEqual("scrypt$131072$8$1$32", app.configure_password_kdf(99, 99))
+            self.assertLessEqual(app.PASSWORD_KDF_CONCURRENCY, 8)
+            app.configure_password_kdf(12, 1)  # cheap, so the test stays fast
+            digest = app.password_digest("correct horse battery", b"0123456789abcdef")
+            self.assertEqual(32, len(digest))
+        finally:
+            app.configure_password_kdf(*saved)
+
     def test_health_is_public(self):
         status, data = self.request("GET", "/health")
         self.assertEqual(200, status)
