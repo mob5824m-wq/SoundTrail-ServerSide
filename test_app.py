@@ -580,6 +580,166 @@ class SyncApiTest(unittest.TestCase):
         finally:
             app.configure_password_kdf(*saved)
 
+    def test_session_current_describes_the_caller(self):
+        token = self.account["token"]
+        status, info = self.request("GET", "/v1/session/current", token=token)
+
+        self.assertEqual(200, status)
+        self.assertEqual(self.account["accountId"], info["accountId"])
+        self.assertEqual("music@example.net", info["email"])
+        self.assertEqual(self.account["sessionId"], info["sessionId"])
+        self.assertGreater(info["expiresAt"], info["createdAt"])
+        self.assertNotIn("token", info)
+
+    def test_sessions_can_be_listed_and_another_device_signed_out(self):
+        first = self.account["token"]
+        _, second = self.request(
+            "POST", "/v1/sessions", {"email": "music@example.net", "password": "correct horse battery"}
+        )
+        status, listing = self.request("GET", "/v1/sessions", token=second["token"])
+
+        self.assertEqual(200, status)
+        ids = [session["id"] for session in listing["sessions"]]
+        self.assertEqual(2, len(ids))
+        self.assertIn(self.account["sessionId"], ids)
+        self.assertIn(second["sessionId"], ids)
+        current = [session for session in listing["sessions"] if session["current"]]
+        self.assertEqual([second["sessionId"]], [session["id"] for session in current])
+        for session in listing["sessions"]:
+            self.assertNotIn("token", session)
+            self.assertNotIn("tokenHash", session)
+
+        # Sign the first device out by id; its token stops working, the caller's keeps working.
+        status, revoked = self.request("DELETE", f"/v1/sessions/{self.account['sessionId']}", token=second["token"])
+        self.assertEqual(200, status)
+        self.assertTrue(revoked["revoked"])
+        self.assertFalse(revoked["signedOut"])
+        self.assertEqual(401, self.request("GET", "/v1/events", token=first)[0])
+        self.assertEqual(200, self.request("GET", "/v1/events", token=second["token"])[0])
+
+    def test_revoking_an_unknown_foreign_or_malformed_session_is_reported(self):
+        token = self.account["token"]
+        _, other = self.request(
+            "POST", "/v1/accounts", {"email": "other@example.net", "password": "another strong pass"}
+        )
+        _, other_sessions = self.request("GET", "/v1/sessions", token=other["token"])
+        other_id = other_sessions["sessions"][0]["id"]
+
+        # Another account's session must not be revocable, and must not be distinguishable from
+        # an id that does not exist.
+        self.assertEqual(404, self.request("DELETE", f"/v1/sessions/{other_id}", token=token)[0])
+        self.assertEqual(404, self.request("DELETE", f"/v1/sessions/{uuid.uuid4()}", token=token)[0])
+        self.assertEqual(400, self.request("DELETE", "/v1/sessions/not-a-uuid", token=token)[0])
+        self.assertEqual(401, self.request("DELETE", f"/v1/sessions/{other_id}")[0])
+        # The other account is untouched.
+        self.assertEqual(200, self.request("GET", "/v1/sessions", token=other["token"])[0])
+
+    def test_renewing_rotates_the_token_and_invalidates_the_old_one(self):
+        old_token = self.account["token"]
+        status, renewed = self.request("POST", "/v1/sessions/current/renew", token=old_token)
+
+        self.assertEqual(200, status)
+        self.assertNotEqual(old_token, renewed["token"])
+        self.assertGreater(renewed["expiresAt"], int(time.time()))
+        self.assertEqual(401, self.request("GET", "/v1/events", token=old_token)[0])
+        self.assertEqual(200, self.request("GET", "/v1/events", token=renewed["token"])[0])
+        self.assertEqual(401, self.request("POST", "/v1/sessions/current/renew")[0])
+        # Renewal replaces the session rather than adding one.
+        _, listing = self.request("GET", "/v1/sessions", token=renewed["token"])
+        self.assertEqual(1, len(listing["sessions"]))
+        self.assertEqual(renewed["sessionId"], listing["sessions"][0]["id"])
+
+    def test_password_change_requires_the_current_password_and_signs_devices_out(self):
+        token = self.account["token"]
+        _, other_device = self.request(
+            "POST", "/v1/sessions", {"email": "music@example.net", "password": "correct horse battery"}
+        )
+
+        status, _ = self.request(
+            "POST", "/v1/account/current/password",
+            {"currentPassword": "wrong password", "newPassword": "an even stronger pass"}, token,
+        )
+        self.assertEqual(403, status)
+        # A failed attempt changes nothing: both sessions still work.
+        self.assertEqual(200, self.request("GET", "/v1/events", token=token)[0])
+        self.assertEqual(200, self.request("GET", "/v1/events", token=other_device["token"])[0])
+
+        status, changed = self.request(
+            "POST", "/v1/account/current/password",
+            {"currentPassword": "correct horse battery", "newPassword": "an even stronger pass"}, token,
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(changed["changed"])
+        self.assertEqual(2, changed["revokedSessions"])
+        # Every old token is dead, including the caller's; the response carries the new one.
+        self.assertEqual(401, self.request("GET", "/v1/events", token=token)[0])
+        self.assertEqual(401, self.request("GET", "/v1/events", token=other_device["token"])[0])
+        self.assertEqual(200, self.request("GET", "/v1/events", token=changed["token"])[0])
+        # The new password signs in; the old one does not.
+        self.assertEqual(
+            401,
+            self.request("POST", "/v1/sessions", {"email": "music@example.net", "password": "correct horse battery"})[0],
+        )
+        self.assertEqual(
+            200,
+            self.request("POST", "/v1/sessions", {"email": "music@example.net", "password": "an even stronger pass"})[0],
+        )
+
+    def test_password_change_rejects_a_reused_or_weak_password(self):
+        token = self.account["token"]
+        self.assertEqual(
+            400,
+            self.request(
+                "POST", "/v1/account/current/password",
+                {"currentPassword": "correct horse battery", "newPassword": "correct horse battery"}, token,
+            )[0],
+        )
+        self.assertEqual(
+            400,
+            self.request(
+                "POST", "/v1/account/current/password",
+                {"currentPassword": "correct horse battery", "newPassword": "short"}, token,
+            )[0],
+        )
+        self.assertEqual(401, self.request("POST", "/v1/account/current/password", {"currentPassword": "x", "newPassword": "y"})[0])
+
+    def test_the_session_list_is_capped_per_account(self):
+        newest = None
+        for _ in range(app.MAX_SESSIONS_PER_ACCOUNT + 3):
+            newest = app.login(self.db_path, "music@example.net", "correct horse battery")
+        with app.db_session(self.db_path) as db:
+            count = db.execute(
+                "SELECT COUNT(*) FROM sessions WHERE account_id = ?", (self.account["accountId"],)
+            ).fetchone()[0]
+        self.assertEqual(app.MAX_SESSIONS_PER_ACCOUNT, count)
+        # The cap keeps the newest sessions, so the account never carries an unbounded list: the
+        # newest token works and the oldest (from setUp) has been evicted.
+        self.assertEqual(200, self.request("GET", "/v1/sessions", token=newest["token"])[0])
+        self.assertEqual(401, self.request("GET", "/v1/events", token=self.account["token"])[0])
+
+    def test_sessions_written_before_ids_existed_are_migrated(self):
+        token = self.account["token"]
+        record = app.session_record(self.db_path, token)
+        with app.db_session(self.db_path) as db:
+            db.execute("UPDATE sessions SET session_id = NULL")
+            db.execute("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'")
+
+        app.initialize_db(self.db_path)
+
+        migrated = app.session_record(self.db_path, token)
+        self.assertIsNotNone(migrated)
+        self.assertTrue(migrated["sessionId"])
+        with app.db_session(self.db_path) as db:
+            self.assertEqual(
+                str(app.SCHEMA_VERSION),
+                db.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()[0],
+            )
+        # The token still authenticates and the migration assigned exactly one id.
+        self.assertEqual(record["accountId"], migrated["accountId"])
+        _, listing = self.request("GET", "/v1/sessions", token=token)
+        self.assertEqual(1, len(listing["sessions"]))
+        self.assertEqual(migrated["sessionId"], listing["sessions"][0]["id"])
+
     def test_health_is_public(self):
         status, data = self.request("GET", "/health")
         self.assertEqual(200, status)

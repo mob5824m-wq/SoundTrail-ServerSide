@@ -49,9 +49,12 @@ GRACEFUL_STOP_SECONDS = 10
 EXTRACTION_TMP_PREFIX = "soundtrail-youtube-"
 # Bumped when initialize_db has to change an existing database. Stored in schema_meta so a
 # migration runs once instead of on every start.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 SESSION_SECONDS = 30 * 24 * 60 * 60
+# How many live sessions one account may hold; the oldest are evicted beyond this, so repeated
+# sign-ins cannot grow the table without bound (and an attacker cannot bury a stolen session).
+MAX_SESSIONS_PER_ACCOUNT = 20
 PASSWORD_MIN_LENGTH = 10
 PASSWORD_MAX_LENGTH = 128
 # scrypt work factor for new passwords, as log2(N). Each hash needs 128*R*N bytes, so the default
@@ -70,6 +73,7 @@ LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
 LOGIN_LOCKOUT_SECONDS = 15 * 60
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 BASE64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
 class QuotaExceededError(ValueError):
@@ -238,11 +242,13 @@ def initialize_db(path: str) -> None:
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 token_hash BLOB PRIMARY KEY,
+                session_id TEXT,
                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
                 expires_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS sessions_account_idx ON sessions(account_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_id_idx ON sessions(session_id);
             CREATE TABLE IF NOT EXISTS sync_events (
                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
                 sequence INTEGER NOT NULL,
@@ -294,6 +300,19 @@ def initialize_db(path: str) -> None:
                         int(row["sequence"]),
                     ),
                 )
+        if version < 4:
+            # Sessions gained a public, non-secret id so the app can list and revoke them without
+            # ever handling the bearer token again.
+            if not _has_column(db, "sessions", "session_id"):
+                db.execute("ALTER TABLE sessions ADD COLUMN session_id TEXT")
+            for row in db.execute("SELECT token_hash FROM sessions WHERE session_id IS NULL").fetchall():
+                db.execute(
+                    "UPDATE sessions SET session_id = ? WHERE token_hash = ?",
+                    (str(uuid.uuid4()), row["token_hash"]),
+                )
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_id_idx ON sessions(session_id)"
+            )
         if version < 3:
             # Accounts written before password schemes were recorded are compared with the old
             # work factor and re-hashed with the current one after their next successful login.
@@ -386,17 +405,33 @@ def _validate_password(raw: Any) -> str:
     return raw
 
 
-def _issue_session(db: sqlite3.Connection, account_id: str, now: int | None = None) -> tuple[str, int]:
+def _issue_session(
+    db: sqlite3.Connection, account_id: str, now: int | None = None
+) -> tuple[str, int, str]:
+    """Creates a session and returns (token, expires_at, session_id). The token is never stored."""
     issued_at = int(time.time()) if now is None else now
     db.execute("DELETE FROM sessions WHERE expires_at <= ?", (issued_at,))
     token = secrets.token_urlsafe(32)
+    session_id = str(uuid.uuid4())
     expires = issued_at + SESSION_SECONDS
     token_hash = hashlib.sha256(token.encode("ascii")).digest()
     db.execute(
-        "INSERT INTO sessions(token_hash, account_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
-        (token_hash, account_id, expires, issued_at),
+        "INSERT INTO sessions(token_hash, session_id, account_id, expires_at, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (token_hash, session_id, account_id, expires, issued_at),
     )
-    return token, expires
+    # Keep the account's session list bounded: evict the oldest beyond the cap. A user who signs
+    # in from many devices (or an attacker trying to bury a stolen session) cannot grow it without
+    # limit; the newest sessions, including the one just issued, always survive.
+    keep = db.execute(
+        "SELECT token_hash FROM sessions WHERE account_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        (account_id, MAX_SESSIONS_PER_ACCOUNT),
+    ).fetchall()
+    keep_hashes = {row["token_hash"] for row in keep}
+    for row in db.execute("SELECT token_hash FROM sessions WHERE account_id = ?", (account_id,)).fetchall():
+        if row["token_hash"] not in keep_hashes:
+            db.execute("DELETE FROM sessions WHERE token_hash = ?", (row["token_hash"],))
+    return token, expires, session_id
 
 
 def create_account(db_path: str, raw_email: Any, raw_password: Any) -> dict[str, Any]:
@@ -414,10 +449,13 @@ def create_account(db_path: str, raw_email: Any, raw_password: Any) -> dict[str,
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (account_id, email, salt, digest, scheme, now),
             )
-            token, expires = _issue_session(db, account_id, now)
+            token, expires, session_id = _issue_session(db, account_id, now)
     except sqlite3.IntegrityError as exc:
         raise ValueError("An account with that email already exists.") from exc
-    return {"accountId": account_id, "email": email, "token": token, "expiresAt": expires}
+    return {
+        "accountId": account_id, "email": email, "token": token,
+        "expiresAt": expires, "sessionId": session_id,
+    }
 
 
 def login(db_path: str, raw_email: Any, raw_password: Any) -> dict[str, Any]:
@@ -446,21 +484,142 @@ def login(db_path: str, raw_email: Any, raw_password: Any) -> dict[str, Any]:
                 (upgraded_salt, password_digest(raw_password, upgraded_salt, upgraded_scheme),
                  upgraded_scheme, row["id"]),
             )
-        token, expires = _issue_session(db, row["id"], now)
-    return {"accountId": row["id"], "email": email, "token": token, "expiresAt": expires}
+        token, expires, session_id = _issue_session(db, row["id"], now)
+    return {
+        "accountId": row["id"], "email": email, "token": token,
+        "expiresAt": expires, "sessionId": session_id,
+    }
 
 
-def authenticate(db_path: str, token: str, now: int | None = None) -> str | None:
+def session_record(db_path: str, token: str, now: int | None = None) -> dict[str, Any] | None:
+    """The live session for a bearer token, or None when it is unknown, revoked, or expired."""
     if not token or len(token) > 256:
         return None
     token_hash = hashlib.sha256(token.encode("ascii", errors="ignore")).digest()
     current = int(time.time()) if now is None else now
     with db_session(db_path) as db:
         row = db.execute(
-            "SELECT account_id FROM sessions WHERE token_hash = ? AND expires_at > ?",
+            "SELECT session_id, account_id, expires_at, created_at FROM sessions "
+            "WHERE token_hash = ? AND expires_at > ?",
             (token_hash, current),
         ).fetchone()
-    return row["account_id"] if row else None
+    if row is None:
+        return None
+    return {
+        "sessionId": row["session_id"] or "",
+        "accountId": row["account_id"],
+        "expiresAt": int(row["expires_at"]),
+        "createdAt": int(row["created_at"]),
+    }
+
+
+def authenticate(db_path: str, token: str, now: int | None = None) -> str | None:
+    record = session_record(db_path, token, now)
+    return record["accountId"] if record else None
+
+
+def account_email(db_path: str, account_id: str) -> str:
+    with db_session(db_path) as db:
+        row = db.execute("SELECT email FROM accounts WHERE id = ?", (account_id,)).fetchone()
+    return row["email"] if row else ""
+
+
+def list_sessions(db_path: str, account_id: str, current_session_id: str, now: int | None = None) -> list[dict[str, Any]]:
+    """Live sessions for an account, newest first. Ids and timestamps only: never a token."""
+    current = int(time.time()) if now is None else now
+    with db_session(db_path) as db:
+        rows = db.execute(
+            "SELECT session_id, expires_at, created_at FROM sessions "
+            "WHERE account_id = ? AND expires_at > ? ORDER BY created_at DESC, rowid DESC",
+            (account_id, current),
+        ).fetchall()
+    return [
+        {
+            "id": row["session_id"] or "",
+            "createdAt": int(row["created_at"]),
+            "expiresAt": int(row["expires_at"]),
+            "current": (row["session_id"] or "") == current_session_id,
+        }
+        for row in rows
+    ]
+
+
+def revoke_session_by_id(db_path: str, account_id: str, session_id: str) -> str:
+    """Revokes one of this account's sessions. Returns 'revoked' or raises ValueError."""
+    if not isinstance(session_id, str) or not UUID_RE.fullmatch(session_id):
+        raise ValueError("That session id is not valid.")
+    with db_session(db_path) as db:
+        removed = db.execute(
+            "DELETE FROM sessions WHERE account_id = ? AND session_id = ?", (account_id, session_id)
+        ).rowcount
+    if not removed:
+        raise LookupError("That session is not signed in on this account.")
+    return "revoked"
+
+
+def renew_session(db_path: str, token: str) -> dict[str, Any]:
+    """Rotates the caller's bearer token, so a copied token stops working.
+
+    The 30-day lifetime restarts, the old token is deleted in the same transaction, and the
+    response carries the only copy of the new one. The session id changes too: a renewed session
+    is a new entry in the app's list, so a stale id cannot be used to revoke the live one.
+    """
+    record = session_record(db_path, token)
+    if record is None:
+        raise ValueError("Sign in again to renew this session.")
+    now = int(time.time())
+    with db_session(db_path) as db:
+        db.execute(
+            "DELETE FROM sessions WHERE token_hash = ?",
+            (hashlib.sha256(token.encode("ascii", errors="ignore")).digest(),),
+        )
+        new_token, expires, session_id = _issue_session(db, record["accountId"], now)
+    return {"token": new_token, "expiresAt": expires, "sessionId": session_id}
+
+
+def change_password(
+    db_path: str,
+    account_id: str,
+    current_password: Any,
+    new_password: Any,
+) -> dict[str, Any]:
+    """Changes the password and signs every device out, returning a fresh session for this one.
+
+    The current password is required, so a stolen bearer token alone cannot take the account
+    over — it can only be ended by the change, never performed by it.
+    """
+    if not isinstance(current_password, str) or not 1 <= len(current_password) <= PASSWORD_MAX_LENGTH:
+        raise PermissionError("The current password is incorrect.")
+    password = _validate_password(new_password)
+    now = int(time.time())
+    with db_session(db_path) as db:
+        row = db.execute(
+            "SELECT password_salt, password_hash, password_scheme FROM accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("That account no longer exists.")
+        stored_scheme = row["password_scheme"] or LEGACY_PASSWORD_SCHEME
+        actual = password_digest(current_password, bytes(row["password_salt"]), stored_scheme)
+        if not hmac.compare_digest(actual, bytes(row["password_hash"])):
+            raise PermissionError("The current password is incorrect.")
+        if hmac.compare_digest(password.encode("utf-8"), current_password.encode("utf-8")):
+            raise ValueError("Choose a password different from the current one.")
+        salt = secrets.token_bytes(16)
+        scheme = password_scheme()
+        db.execute(
+            "UPDATE accounts SET password_salt = ?, password_hash = ?, password_scheme = ? WHERE id = ?",
+            (salt, password_digest(password, salt, scheme), scheme, account_id),
+        )
+        revoked = db.execute("DELETE FROM sessions WHERE account_id = ?", (account_id,)).rowcount
+        token, expires, session_id = _issue_session(db, account_id, now)
+    return {
+        "changed": True,
+        "revokedSessions": int(revoked),
+        "token": token,
+        "expiresAt": expires,
+        "sessionId": session_id,
+    }
 
 
 def revoke_session(db_path: str, token: str) -> None:
@@ -850,13 +1009,17 @@ def make_handler(db_path: str):
                 raise ValueError("Request body must be a JSON object.")
             return parsed
 
-        def _bearer(self) -> tuple[str, str] | None:
+        def _bearer(self) -> dict[str, Any] | None:
+            """The authenticated session for this request, or None."""
             header = self.headers.get("Authorization", "")
             prefix, _, token = header.partition(" ")
             if prefix.lower() != "bearer" or not token:
                 return None
-            account_id = authenticate(db_path, token)
-            return (account_id, token) if account_id else None
+            record = session_record(db_path, token)
+            if record is None:
+                return None
+            record["token"] = token
+            return record
 
         def _rate_limit_ip(self) -> str:
             peer = self.client_address[0]
@@ -872,6 +1035,84 @@ def make_handler(db_path: str):
                 pass
             return peer
 
+        def _get_sessions(self, path: str) -> None:
+            """`GET /v1/session/current` describes this session; `GET /v1/sessions` lists them all."""
+            if not limiter.allow("session-read", self._rate_limit_ip(), limit=120, window_seconds=60):
+                self._send(429, {"error": "Too many requests. Try again shortly."}, {"Retry-After": "60"})
+                return
+            auth = self._bearer()
+            if not auth:
+                self._send(401, {"error": "Sign in to sync."})
+                return
+            if path == "/v1/session/current":
+                self._send(200, {
+                    "accountId": auth["accountId"],
+                    "email": account_email(db_path, auth["accountId"]),
+                    "sessionId": auth["sessionId"],
+                    "createdAt": auth["createdAt"],
+                    "expiresAt": auth["expiresAt"],
+                })
+                return
+            self._send(200, {
+                "sessions": list_sessions(db_path, auth["accountId"], auth["sessionId"]),
+                "maxSessions": MAX_SESSIONS_PER_ACCOUNT,
+            })
+
+        def _post_session_current(self, path: str) -> None:
+            """Renew this session's token, or change the account password."""
+            auth = self._bearer()
+            if not auth:
+                self._send(401, {"error": "Sign in to sync."})
+                return
+            if path == "/v1/sessions/current/renew":
+                if not limiter.allow("session-renew", auth["accountId"], limit=30, window_seconds=60):
+                    self._send(429, {"error": "Too many session renewals. Try again shortly."}, {"Retry-After": "60"})
+                    return
+                try:
+                    self._send(200, renew_session(db_path, auth["token"]))
+                except ValueError as exc:
+                    self._send(401, {"error": str(exc)})
+                return
+
+            # Changing the password requires the current one: a stolen token must not be able to
+            # lock the owner out, so failures are also throttled like sign-in failures.
+            if not limiter.allow("password-change", self._rate_limit_ip(), limit=10, window_seconds=3600):
+                self._send(429, {"error": "Too many password changes. Try again later."}, {"Retry-After": "3600"})
+                return
+            throttle_key = f"password:{auth['accountId']}"
+            locked = login_throttle.locked_for(throttle_key)
+            if locked:
+                self._send(429, {"error": "Too many failed attempts. Try again shortly."}, {"Retry-After": str(locked)})
+                return
+            try:
+                body = self._body()
+            except OverflowError as exc:
+                self._send(413, {"error": str(exc)})
+                return
+            except RequestTimeoutError as exc:
+                self.close_connection = True
+                try:
+                    self._send(408, {"error": str(exc)})
+                except OSError:
+                    pass
+                return
+            except ValueError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            try:
+                result = change_password(
+                    db_path, auth["accountId"], body.get("currentPassword"), body.get("newPassword")
+                )
+            except PermissionError as exc:
+                login_throttle.record_failure(throttle_key)
+                self._send(403, {"error": str(exc)})
+                return
+            except ValueError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            login_throttle.record_success(throttle_key)
+            self._send(200, result)
+
         def _post_youtube_audio(self) -> None:
             auth = self._bearer()
             if not auth:
@@ -880,7 +1121,7 @@ def make_handler(db_path: str):
             client_ip = self._rate_limit_ip()
             if (
                 not limiter.allow("youtube-ip", client_ip, limit=30, window_seconds=60)
-                or not limiter.allow("youtube-account", auth[0], limit=20, window_seconds=60)
+                or not limiter.allow("youtube-account", auth["accountId"], limit=20, window_seconds=60)
             ):
                 self._send(429, {"error": "Too many audio extraction requests. Try again shortly."}, {"Retry-After": "60"})
                 return
@@ -950,6 +1191,9 @@ def make_handler(db_path: str):
             if parsed.path == "/health":
                 self._send(200, {"status": "ok", "version": API_VERSION})
                 return
+            if parsed.path in ("/v1/session/current", "/v1/sessions"):
+                self._get_sessions(parsed.path)
+                return
             if parsed.path != "/v1/events":
                 self._send(404, {"error": "Not found."})
                 return
@@ -964,7 +1208,7 @@ def make_handler(db_path: str):
             try:
                 after = int(query.get("after", ["0"])[0])
                 limit = int(query.get("limit", [str(MAX_PAGE_SIZE)])[0])
-                result = read_events(db_path, auth[0], after, limit)
+                result = read_events(db_path, auth["accountId"], after, limit)
                 self._send(200, result)
             except (ValueError, TypeError) as exc:
                 self._send(400, {"error": str(exc)})
@@ -973,6 +1217,9 @@ def make_handler(db_path: str):
             parsed = urlsplit(self.path)
             if parsed.path == "/v1/youtube/audio":
                 self._post_youtube_audio()
+                return
+            if parsed.path in ("/v1/sessions/current/renew", "/v1/account/current/password"):
+                self._post_session_current(parsed.path)
                 return
             peer = self._rate_limit_ip()
             limiter_config = {
@@ -1021,11 +1268,11 @@ def make_handler(db_path: str):
                     self._send(200, result)
                 elif parsed.path == "/v1/events":
                     assert auth is not None
-                    result = append_events(db_path, auth[0], body.get("events"))
+                    result = append_events(db_path, auth["accountId"], body.get("events"))
                     self._send(200, result)
                 else:
                     assert auth is not None
-                    result = compact_history(db_path, auth[0], body.get("snapshot"))
+                    result = compact_history(db_path, auth["accountId"], body.get("snapshot"))
                     self._send(200, result)
             except OverflowError as exc:
                 self._send(413, {"error": str(exc)})
@@ -1048,12 +1295,31 @@ def make_handler(db_path: str):
 
         def do_DELETE(self) -> None:
             path = urlsplit(self.path).path
-            if path not in ("/v1/sessions/current", "/v1/account/current"):
+            session_prefix = "/v1/sessions/"
+            if path not in ("/v1/sessions/current", "/v1/account/current") and not (
+                path.startswith(session_prefix) and len(path) > len(session_prefix)
+            ):
                 self._send(404, {"error": "Not found."})
                 return
             auth = self._bearer()
             if not auth:
                 self._send(401, {"error": "Sign in to sync."})
+                return
+            if path.startswith(session_prefix) and path != "/v1/sessions/current":
+                # Sign another device out by its public session id; the token is never handled.
+                if not limiter.allow("session-revoke", self._rate_limit_ip(), limit=60, window_seconds=60):
+                    self._send(429, {"error": "Too many requests. Try again shortly."}, {"Retry-After": "60"})
+                    return
+                target = path[len(session_prefix):]
+                try:
+                    revoke_session_by_id(db_path, auth["accountId"], target)
+                except ValueError as exc:
+                    self._send(400, {"error": str(exc)})
+                    return
+                except LookupError as exc:
+                    self._send(404, {"error": str(exc)})
+                    return
+                self._send(200, {"revoked": True, "signedOut": target == auth["sessionId"]})
                 return
             if path == "/v1/account/current" and not limiter.allow(
                 "account-delete", self._rate_limit_ip(), limit=5, window_seconds=3600
@@ -1061,10 +1327,10 @@ def make_handler(db_path: str):
                 self._send(429, {"error": "Too many account deletion requests."}, {"Retry-After": "3600"})
                 return
             if path == "/v1/sessions/current":
-                revoke_session(db_path, auth[1])
+                revoke_session(db_path, auth["token"])
                 self._send(200, {"signedOut": True})
                 return
-            delete_account(db_path, auth[0])
+            delete_account(db_path, auth["accountId"])
             self._send(200, {"deleted": True})
 
         def do_PUT(self) -> None:
