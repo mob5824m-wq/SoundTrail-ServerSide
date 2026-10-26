@@ -16,11 +16,11 @@ The repository is flat: the service entry point is [`app.py`](app.py), the launc
 
 For cloud sync, the Android app encrypts each entity event and checkpoint on-device with AES-256-GCM. The server cannot decrypt pins, coordinates, playlist details, automation rules, song links, or the recovery key. It does see account email addresses, salted password hashes, session metadata, event IDs/sequences, ciphertext sizes, client IPs in proxy/server logs, and request timing.
 
-The separate YouTube audio endpoint is **not end-to-end encrypted**: when used, the server receives a video ID, requests a public audio-only stream, and temporarily stores the resulting audio in a per-request directory under `/tmp` while returning it to the app. Temporary files are removed when the response finishes or fails. The server does not receive YouTube cookies, Google OAuth tokens, or a YouTube Music app session. Extraction uses the third-party `yt-dlp` project and is unofficial; it may break when YouTube changes. It does not handle private/age-restricted videos, logins, cookies, DRM, or access-control bypasses. Use it only for audio you own or have explicit permission to download, and follow the rules that apply to your content and location. Soundtrail asks the user to confirm permission before requesting extraction; the server cannot independently verify rights.
+The separate YouTube audio endpoint is **not end-to-end encrypted**: when used, the server receives a video ID, requests a public audio-only stream, and temporarily stores the resulting audio in a per-request directory under `/tmp` while returning it to the app. Temporary files are removed when the response finishes or fails, and folders left behind by a crash are swept at the next start; only directories the service created and that are older than an hour in the system temp folder are removed. The server does not receive YouTube cookies, Google OAuth tokens, or a YouTube Music app session. Extraction uses the third-party `yt-dlp` project and is unofficial; it may break when YouTube changes. It does not handle private/age-restricted videos, logins, cookies, DRM, or access-control bypasses. Use it only for audio you own or have explicit permission to download, and follow the rules that apply to your content and location. Soundtrail asks the user to confirm permission before requesting extraction; the server cannot independently verify rights.
 
 Keep the machine, database volume, TLS proxy, backups, logs, and `/tmp` storage secured. The database has a **64 MiB per-account quota** for encrypted sync events and checkpoints. Event rows are pruned into an encrypted client checkpoint after sync; retry-receipt metadata is also pruned at that point. Old delivery IDs may therefore be accepted again after compaction, but encrypted entity clocks and tombstones make duplicate old versions harmless. Snapshots are limited to 8 MiB.
 
-The server applies in-process sliding-window limits to account creation, login, sync reads/writes, checkpoints, account deletion, and extraction; extraction also has a two-job concurrency cap. Current defaults are 5 account creations/hour/IP, 20 logins/minute/IP, 600 sync reads and writes/minute/IP, 10 checkpoints/minute/IP, 5 account deletions/hour/IP, and 30 extraction requests/minute/IP plus 20/minute/account. In-process limits reset on restart and are per instance, so keep the API behind a reverse proxy with its own request/body limits and rate limiting, especially if you run multiple workers. The app trusts `X-Forwarded-For` only when its direct peer is private/loopback; configure the proxy to overwrite or sanitize client-supplied forwarding headers before passing them upstream. There is no email verification or password-reset service. An authenticated account-deletion endpoint is available.
+The server applies in-process sliding-window limits to account creation, login, sync reads/writes, checkpoints, account deletion, and extraction; extraction also has a two-job concurrency cap. Current defaults are 5 account creations/hour/IP, 20 logins/minute/IP, 600 sync reads and writes/minute/IP, 10 checkpoints/minute/IP, 5 account deletions/hour/IP, and 30 extraction requests/minute/IP plus 20/minute/account. In-process limits reset on restart and are per instance, so keep the API behind a reverse proxy with its own request/body limits and rate limiting, especially if you run multiple workers. Each connection is also limited to 30 seconds of inactivity: a client that opens a request and stalls while sending its body gets `408 Request Timeout` and the socket is closed, so slow clients cannot hold worker threads open. Normal requests are small and complete far sooner; a very slow link uploading an 8 MiB snapshot may need a proxy with a larger upstream timeout. The app trusts `X-Forwarded-For` only when its direct peer is private/loopback; configure the proxy to overwrite or sanitize client-supplied forwarding headers before passing them upstream. There is no email verification or password-reset service. An authenticated account-deletion endpoint is available.
 
 ## Run natively (no Docker, any OS and CPU)
 
@@ -42,7 +42,7 @@ The server is plain Python. It runs on Linux, macOS, Windows, and BSD, on x86-64
    - `python3 run.py --setup` prepares the environment without starting the server.
    - `python3 run.py --test` runs the API test suite.
 
-5. Put a reverse proxy with TLS in front of it. The API listens on `127.0.0.1:8080` by default. Keep that loopback default and proxy to it, for example with [`Caddyfile.example`](Caddyfile.example) (Caddy runs on the same machine, so the upstream is `127.0.0.1:8080`). Do not expose port 8080 directly.
+5. Put a reverse proxy with TLS in front of it. The API listens on `127.0.0.1:8080` by default. Keep that loopback default and proxy to it, for example with [`Caddyfile.example`](Caddyfile.example) (Caddy runs on the same machine, so the upstream is `127.0.0.1:8080`). The example needs Caddy 2.5 or newer for `request_body`; it caps uploads at the edge and overwrites `X-Forwarded-For` with the proxy's own view of the client. Do not expose port 8080 directly.
 
 The SQLite database is created at `data/soundtrail.sqlite3`. Set `SOUNDTRAIL_DB` to store it elsewhere (for example on a dedicated disk).
 
@@ -97,18 +97,46 @@ Wants=network-online.target
 
 [Service]
 User=soundtrail
+Group=soundtrail
 WorkingDirectory=/opt/soundtrail
 Environment=SOUNDTRAIL_HOST=127.0.0.1
 Environment=PORT=8080
 Environment=SOUNDTRAIL_DB=/var/lib/soundtrail/soundtrail.sqlite3
 ExecStart=/usr/bin/python3 /opt/soundtrail/run.py
 Restart=on-failure
+# systemd sends SIGTERM first (handled as a graceful stop) and only escalates after this.
+TimeoutStopSec=30
+
+# Optional hardening. These keep the service to its own folder and a private /tmp, where
+# YouTube extraction writes; nothing else on the host becomes writable to it.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/soundtrail
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 Then run `sudo systemctl daemon-reload && sudo systemctl enable --now soundtrail-sync`.
+
+Create the data folder first and give it to the service user (`sudo install -d -o soundtrail -g soundtrail -m 700 /var/lib/soundtrail`),
+and keep the repository readable but not writable by that user. Because `ReadWritePaths` lists only the data
+folder, snapshots written elsewhere (`SOUNDTRAIL_BACKUP_DIR`) would fail under `ProtectSystem=strict` unless
+they are also under `/var/lib/soundtrail` or added to `ReadWritePaths`.
+
+`SIGTERM` and `SIGINT` close the listener, then give requests already in progress up to ten seconds to
+finish, so an upload in flight is answered instead of dropped. After that the background backup thread is
+asked to stop (waiting up to five seconds for a snapshot in progress) and the process exits with status 0,
+so `systemctl stop`, `docker stop`, and Ctrl-C all shut down cleanly. New connections are refused as soon
+as the stop begins, and the unit's `TimeoutStopSec` caps the whole sequence.
 
 **macOS (launchd)** and **Windows** (Task Scheduler, or a service wrapper such as NSSM): run `python3 run.py` (or `py -3 run.py`) from the repository folder at boot, with the working directory set to it, and set `SOUNDTRAIL_HOST`/`SOUNDTRAIL_DB` as environment variables for that task.
 
@@ -132,7 +160,11 @@ stop the service, keep a copy of the current folder, and replace the `data` fold
 `SOUNDTRAIL_DB` location) with the archived contents. Test restoration, and keep an off-host copy
 outside the server's own volume.
 
-The `/health` endpoint reports liveness only. Extraction needs outbound network access to YouTube and enough temporary disk space for up to two concurrent 250 MiB downloads plus working files.
+The `/health` endpoint reports liveness only and does not read or write the database, so it is safe
+for proxy and container health checks; there is no readiness or metrics endpoint. On startup the service
+also removes leftover extraction folders older than an hour from the system temp folder. Extraction needs
+outbound network access to YouTube and enough temporary disk space for up to two concurrent 250 MiB
+downloads plus working files.
 
 ### Dependencies
 
@@ -167,6 +199,24 @@ Each account's cursor is independent and every sync read/write is scoped to that
 - `SOUNDTRAIL_BACKUP_KEEP` — snapshots retained after a successful backup (default `7`).
 
 The API intentionally has no password-reset or key-recovery endpoint. If a user loses their 256-bit recovery key, resetting the account password cannot recover encrypted content. Account deletion removes remote encrypted data; it does not erase the user's local device library. If the database is lost, only a database backup can restore the encrypted event log and checkpoints.
+
+## Security
+
+Deploy this only on infrastructure you control, behind the TLS proxy described above, and keep the
+database, backup folder, logs, and `/tmp` readable only by the service user. The service never needs
+root; the running process writes only to its database folder, backup folder, and the system temp folder
+(the launcher's first-run virtual environment lives in the repository folder), and makes no outbound
+connection except to YouTube for the optional audio endpoint.
+
+Before exposing an instance, check that: the API is bound to loopback and not reachable directly; the
+proxy terminates TLS and caps request bodies; the host firewall allows 443 only; backups are copied
+off-host; `yt-dlp`/Deno pins are updated deliberately and extraction is re-tested afterwards; and the
+account-deletion and login rate limits fit your expected traffic.
+
+To report a vulnerability, do **not** open a public issue. Use GitHub's private
+[security advisory](https://github.com/mob5824m-wq/SoundTrail-ServerSide/security/advisories/new) form
+and include the affected commit, how the instance is deployed, and reproduction steps. There is no
+paid bounty and no guaranteed response time, but reports are read and acted on.
 
 ## Run the API tests
 

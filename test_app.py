@@ -1,4 +1,8 @@
 import json
+import os
+import signal
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -293,6 +297,132 @@ class SyncApiTest(unittest.TestCase):
         with app.db_session(self.db_path) as db:
             for table in ("accounts", "sessions", "sync_events", "sync_event_receipts", "sync_snapshots"):
                 self.assertEqual(0, db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+    def test_stale_extraction_folders_are_swept_but_recent_ones_are_kept(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stale = root / f"{app.EXTRACTION_TMP_PREFIX}stale"
+            fresh = root / f"{app.EXTRACTION_TMP_PREFIX}fresh"
+            unrelated = root / "other-tool-data"
+            for folder in (stale, fresh, unrelated):
+                folder.mkdir()
+                (folder / "youtube-audio.m4a").write_bytes(b"audio")
+            old = time.time() - 7200
+            for folder in (stale, unrelated):
+                os.utime(folder, (old, old))
+
+            removed = app.clean_stale_extraction_dirs(max_age_seconds=3600, root=root)
+
+            self.assertEqual(1, removed)
+            self.assertFalse(stale.exists())
+            # A folder that is still in use, or belongs to something else, is left alone.
+            self.assertTrue(fresh.exists())
+            self.assertTrue(unrelated.exists())
+
+    def test_slow_request_bodies_time_out(self):
+        original = app.REQUEST_TIMEOUT_SECONDS
+        app.REQUEST_TIMEOUT_SECONDS = 0.3
+        httpd = None
+        try:
+            httpd = app.ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(self.db_path))
+            httpd.daemon_threads = True
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            with socket.create_connection(("127.0.0.1", httpd.server_address[1]), timeout=5) as client:
+                # Promise a body, then never send it: the server must not wait forever.
+                client.sendall(
+                    b"POST /v1/accounts HTTP/1.1\r\nHost: test\r\n"
+                    b"Content-Type: application/json\r\nContent-Length: 40\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                client.settimeout(5)
+                response = b""
+                while True:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+            status_line = response.split(b"\r\n", 1)[0]
+            self.assertIn(b" 408 ", status_line, status_line)
+            self.assertIn(b"did not arrive", response)
+        finally:
+            app.REQUEST_TIMEOUT_SECONDS = original
+            if httpd is not None:
+                httpd.shutdown()
+                httpd.server_close()
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(signal, "SIGTERM"), "POSIX signals only")
+    def test_sigterm_drains_requests_in_progress_and_exits_cleanly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            log_path = Path(directory) / "server.log"
+            environment = dict(
+                os.environ,
+                SOUNDTRAIL_DB=str(Path(directory) / "server.sqlite3"),
+                SOUNDTRAIL_BACKUP_INTERVAL_SECONDS="0",
+                SOUNDTRAIL_HOST="127.0.0.1",
+                PORT=str(port),
+                PYTHONUNBUFFERED="1",
+            )
+            with log_path.open("w") as log:
+                process = subprocess.Popen(
+                    [sys.executable, str(Path(app.__file__).resolve())],
+                    env=environment,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+            try:
+                self._wait_for_health(port, process)
+                body = json.dumps(
+                    {"email": "drain@example.net", "password": "correct horse battery"}
+                ).encode()
+                client = socket.create_connection(("127.0.0.1", port), timeout=10)
+                try:
+                    # Start a request, ask the server to stop, then finish the upload: the
+                    # response must still arrive and the process must exit with status 0.
+                    client.sendall(
+                        b"POST /v1/accounts HTTP/1.1\r\nHost: test\r\n"
+                        b"Content-Type: application/json\r\n"
+                        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                        + body[:5]
+                    )
+                    time.sleep(0.3)
+                    process.send_signal(signal.SIGTERM)
+                    time.sleep(0.7)
+                    client.sendall(body[5:])
+                    response = b""
+                    while True:
+                        chunk = client.recv(4096)
+                        if not chunk:
+                            break
+                        response += chunk
+                finally:
+                    client.close()
+                self.assertIn(b" 201 ", response.split(b"\r\n", 1)[0])
+                self.assertEqual(0, process.wait(timeout=15))
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+            log_text = log_path.read_text()
+            self.assertIn("Received SIGTERM", log_text)
+            self.assertIn("Soundtrail sync API stopped.", log_text)
+
+    @staticmethod
+    def _wait_for_health(port, process):
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise AssertionError("the server exited before answering /health")
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as response:
+                    if response.status == 200:
+                        return
+            except (urllib.error.URLError, ConnectionError):
+                time.sleep(0.1)
+        raise AssertionError("the server did not become healthy in time")
 
     def test_health_is_public(self):
         status, data = self.request("GET", "/health")

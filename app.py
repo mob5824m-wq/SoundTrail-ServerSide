@@ -15,6 +15,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import signal
 import sqlite3
 import tempfile
 import threading
@@ -39,6 +41,12 @@ MAX_YOUTUBE_AUDIO_BYTES = 250 * 1024 * 1024
 MAX_BATCH_EVENTS = 100
 MAX_PAGE_SIZE = 500
 COMPACT_AFTER_EVENTS = 1_000
+# How long a connection may sit idle mid-request before the server drops it. This stops a slow
+# client from pinning a worker thread, while still leaving room for a large snapshot upload.
+REQUEST_TIMEOUT_SECONDS = 30
+# How long a stop request waits for requests already in progress before closing them.
+GRACEFUL_STOP_SECONDS = 10
+EXTRACTION_TMP_PREFIX = "soundtrail-youtube-"
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 SESSION_SECONDS = 30 * 24 * 60 * 60
 PASSWORD_MIN_LENGTH = 10
@@ -53,6 +61,10 @@ class QuotaExceededError(ValueError):
 
 class YouTubeExtractionError(Exception):
     """A public, audio-only extraction request could not be completed."""
+
+
+class RequestTimeoutError(Exception):
+    """The client did not finish sending its request before the socket timeout."""
 
 
 class RateLimiter:
@@ -514,6 +526,70 @@ def extract_youtube_audio(video_id: str, output_dir: Path) -> tuple[Path, str]:
     return result, content_type
 
 
+class SyncHTTPServer(ThreadingHTTPServer):
+    """Threaded server that can report, and briefly wait for, requests still in progress.
+
+    Handler threads are daemons so a wedged request can never keep the process alive, but a stop
+    request still drains work that is already running, so a client is not cut off mid-upload.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, server_address: Any, handler: Any) -> None:
+        super().__init__(server_address, handler)
+        self._active = 0
+        self._active_lock = threading.Lock()
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        with self._active_lock:
+            self._active += 1
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._active_lock:
+                self._active -= 1
+
+    def active_request_count(self) -> int:
+        with self._active_lock:
+            return self._active
+
+    def wait_for_active_requests(self, timeout: float = GRACEFUL_STOP_SECONDS) -> int:
+        """Give in-flight requests up to `timeout` seconds; return how many are still running."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.active_request_count() == 0:
+                return 0
+            time.sleep(0.05)
+        return self.active_request_count()
+
+
+def clean_stale_extraction_dirs(max_age_seconds: int = 3600, root: Path | None = None) -> int:
+    """Remove extraction folders left behind by a crash or hard kill.
+
+    Normal requests delete their own per-request directory. If the process dies mid-extraction,
+    the audio stays in the system temp folder, so each start sweeps old ones to keep /tmp bounded.
+    Only directories this service created (matching its prefix) are touched.
+    """
+    directory = Path(root) if root is not None else Path(tempfile.gettempdir())
+    try:
+        candidates = list(directory.glob(EXTRACTION_TMP_PREFIX + "*"))
+    except OSError:
+        return 0
+    cutoff = time.time() - max_age_seconds
+    removed = 0
+    for candidate in candidates:
+        try:
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            if candidate.stat().st_mtime > cutoff:
+                continue
+            shutil.rmtree(candidate, ignore_errors=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def make_handler(db_path: str):
     limiter = RateLimiter()
     youtube_slots = threading.BoundedSemaphore(2)
@@ -521,6 +597,9 @@ def make_handler(db_path: str):
     class Handler(BaseHTTPRequestHandler):
         server_version = "SoundtrailSync/1"
         sys_version = ""
+        # BaseHTTPRequestHandler applies this as the socket timeout, so a client that stalls
+        # mid-request cannot hold a thread open indefinitely.
+        timeout = REQUEST_TIMEOUT_SECONDS
 
         def log_message(self, fmt: str, *args: Any) -> None:
             # Do not print authorization headers or request bodies. The URL contains no tokens.
@@ -548,12 +627,19 @@ def make_handler(db_path: str):
             if length > MAX_BODY_BYTES:
                 raise OverflowError("Request body is too large.")
             try:
-                body = json.loads(self.rfile.read(length))
+                body = self.rfile.read(length)
+            except TimeoutError as exc:
+                self.close_connection = True
+                raise RequestTimeoutError(
+                    "The request body did not arrive within the server timeout."
+                ) from exc
+            try:
+                parsed = json.loads(body)
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 raise ValueError("Request body must be valid JSON.") from exc
-            if not isinstance(body, dict):
+            if not isinstance(parsed, dict):
                 raise ValueError("Request body must be a JSON object.")
-            return body
+            return parsed
 
         def _bearer(self) -> tuple[str, str] | None:
             header = self.headers.get("Authorization", "")
@@ -601,6 +687,13 @@ def make_handler(db_path: str):
             except OverflowError as exc:
                 self._send(413, {"error": str(exc)})
                 return
+            except RequestTimeoutError as exc:
+                # The socket already timed out; a bare 408 may not reach the client.
+                try:
+                    self._send(408, {"error": str(exc)})
+                except OSError:
+                    pass
+                return
             except ValueError as exc:
                 self._send(400, {"error": str(exc)})
                 return
@@ -611,7 +704,7 @@ def make_handler(db_path: str):
             headers_sent = False
             try:
                 # A per-request temporary directory is removed whether the stream completes or fails.
-                with tempfile.TemporaryDirectory(prefix="soundtrail-youtube-") as directory:
+                with tempfile.TemporaryDirectory(prefix=EXTRACTION_TMP_PREFIX) as directory:
                     path, content_type = extract_youtube_audio(video_id, Path(directory))
                     self.send_response(200)
                     self.send_header("Content-Type", content_type)
@@ -710,6 +803,12 @@ def make_handler(db_path: str):
                     self._send(200, result)
             except OverflowError as exc:
                 self._send(413, {"error": str(exc)})
+            except RequestTimeoutError as exc:
+                self.close_connection = True
+                try:
+                    self._send(408, {"error": str(exc)})
+                except OSError:
+                    pass
             except QuotaExceededError as exc:
                 self._send(507, {"error": str(exc)})
             except ValueError as exc:
@@ -751,6 +850,13 @@ def make_handler(db_path: str):
     return Handler
 
 
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"signal {signum}"
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -768,6 +874,12 @@ def serve() -> None:
     port = int(os.environ.get("PORT", "8080"))
     initialize_db(db_path)
 
+    # Per-request extraction folders are deleted when the request ends; sweep any left by a
+    # crash so a failed download cannot slowly fill the temp volume.
+    stale = clean_stale_extraction_dirs()
+    if stale:
+        print(f"Removed {stale} stale YouTube extraction folder(s) from {tempfile.gettempdir()}.", flush=True)
+
     # Managed backups are part of the service, not an external cron job to remember. The thread
     # takes a verified snapshot at startup and then on the interval, pruning old versions. Set
     # SOUNDTRAIL_BACKUP_INTERVAL_SECONDS=0 to turn it off and manage copies yourself.
@@ -777,16 +889,35 @@ def serve() -> None:
         _env_int("SOUNDTRAIL_BACKUP_INTERVAL_SECONDS", managed_backups.DEFAULT_INTERVAL_SECONDS),
     )
     backup_keep = max(1, _env_int("SOUNDTRAIL_BACKUP_KEEP", managed_backups.DEFAULT_KEEP))
+    backup_thread: threading.Thread | None = None
     if backup_interval > 0:
-        threading.Thread(
+        backup_thread = threading.Thread(
             target=managed_backups.backup_loop,
             args=(db_path, None, backup_keep, backup_interval, backup_stop),
             name="soundtrail-managed-backups",
             daemon=True,
-        ).start()
+        )
+        backup_thread.start()
 
-    httpd = ThreadingHTTPServer((host, port), make_handler(db_path))
-    httpd.daemon_threads = True
+    httpd = SyncHTTPServer((host, port), make_handler(db_path))
+
+    def request_shutdown(signum: int, _frame: Any) -> None:
+        # serve_forever() runs in this thread, so shutdown() must come from another one.
+        print(f"Received {_signal_name(signum)}; stopping the listener.", flush=True)
+        threading.Thread(target=httpd.shutdown, name="soundtrail-shutdown", daemon=True).start()
+
+    handlers_installed = False
+    for name in ("SIGTERM", "SIGINT"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            signal.signal(signum, request_shutdown)
+            handlers_installed = True
+        except (ValueError, OSError):
+            # Not the main thread, or the platform has no such signal; Ctrl-C still works.
+            pass
+
     print(f"Soundtrail encrypted-sync API listening on {host}:{port}; database={db_path}")
     if backup_interval > 0:
         folder = managed_backups.default_backup_dir(Path(db_path))
@@ -794,13 +925,25 @@ def serve() -> None:
             f"Managed backups: every {backup_interval}s into {folder} "
             f"(keeping {backup_keep}); set SOUNDTRAIL_BACKUP_INTERVAL_SECONDS=0 to disable."
         )
+    if not handlers_installed:
+        print("Signal handlers were not installed; stop the service with Ctrl-C.", flush=True)
     try:
         httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
     finally:
-        backup_stop.set()
+        # Stop accepting connections, then let requests already in progress finish (each one is
+        # bounded by the socket timeout) before the process goes away.
         httpd.server_close()
+        remaining = httpd.wait_for_active_requests()
+        if remaining:
+            print(
+                f"Stop deadline reached with {remaining} request(s) still running; closing them.",
+                flush=True,
+            )
+        # Give an in-flight backup a moment to finish so a restart finds a complete snapshot.
+        backup_stop.set()
+        if backup_thread is not None:
+            backup_thread.join(timeout=5)
+        print("Soundtrail sync API stopped.", flush=True)
 
 
 if __name__ == "__main__":
