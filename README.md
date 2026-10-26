@@ -236,6 +236,10 @@ The client is responsible for rejecting rolled-back snapshots and for treating d
 decision rather than trusting the server's absence of an event. Login lockout and rate limits are
 in-process constants, so they reset on restart and are per instance.
 
+The Android client has to match this server's behaviour to get the benefit of it — status codes, the
+sign-in lockout, redirects, and the limits above. [`docs/android-client-hardening.md`](docs/android-client-hardening.md)
+holds a paste-ready prompt for that repository, written against its actual files.
+
 To report a vulnerability, do **not** open a public issue. Use GitHub's private
 [security advisory](https://github.com/mob5824m-wq/SoundTrail-ServerSide/security/advisories/new) form
 and include the affected commit, how the instance is deployed, and reproduction steps. There is no

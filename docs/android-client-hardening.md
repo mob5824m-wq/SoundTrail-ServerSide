@@ -1,0 +1,147 @@
+# Client hardening: paste-ready prompt for the Android repo
+
+This server's transport, credential, and header hardening only pays off if the client matches it. Hand
+the prompt below to whoever (or whatever agent) works in
+[`mob5824m-wq/Soundtrail`](https://github.com/mob5824m-wq/Soundtrail). It is written against that
+repository's real code: `sync/CloudSyncService.kt`, `integrations/Http.kt`, `integrations/SecretStore.kt`,
+and the two backup-rule XML files.
+
+It assumes this server's current behaviour (status codes, lockout, headers, limits) as described in the
+[HTTP API](../README.md#http-api), [Configuration](../README.md#configuration), and
+[Security](../README.md#security) sections. Nothing in it requires a server change.
+
+---
+
+## Prompt (copy everything below this line)
+
+Harden the Soundtrail Android client to match the newly hardened sync server and to close the
+remaining client-side gaps. Work on your own branch, keep the existing no-third-party-HTTP-dependency
+style, and change no user-visible behaviour except where explicitly listed below. Do not touch the
+Jellyfin flow's ability to use plain HTTP on a home network — that is intentional and must keep working.
+
+### Context: what the server now does (already implemented, do not re-add server code)
+
+- All API responses carry `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`, `Content-Security-Policy: default-src 'none'`, `Cache-Control: no-store`.
+- **`429 Too Many Requests`** with a `Retry-After` header (seconds) is now returned for:
+  - rate limits (per IP: sign-ups, logins, sync reads/writes, checkpoints, deletions, extraction), and
+  - **a new per-address sign-in lockout**: 10 failed sign-ins for the same email in 15 minutes locks
+    that address for 15 minutes. The lockout applies even when no account exists for the address, so it
+    says nothing about whether the account is real.
+- **`408 Request Timeout`** is returned when a request body stalls (30 s socket timeout).
+- **`507 Insufficient Storage`** means the account's 64 MiB encrypted-sync quota is full.
+- **`400`** for malformed payloads (including a new "nested too deeply" case), **`401`** expired/refused
+  session, **`403`** missing extraction permission, **`409`** email already registered, **`413`** body or
+  audio too large, **`422`** extraction failed, **`503`** extractor busy, **`502`** audio source
+  unreachable.
+- `DELETE /v1/sessions/current` and `DELETE /v1/account/current` are unchanged.
+- No response shape changed; `accountId`, `email`, `token`, `expiresAt`, `events`, `nextCursor`,
+  `hasMore`, `snapshot`, `snapshotThrough`, `latestSequence`, `eventCount`, `accepted` are as before.
+
+### Required changes
+
+**1. `sync/CloudSyncService.kt` — status-code handling and retries (`api()` and callers)**
+
+- Replace the string-matching quota detection in `sync()`
+  (`e.message.orEmpty().contains("storage limit")`) with an explicit signal. Add a typed error, e.g.
+  `class CloudSyncException(message: String, val status: Int? = null)`, set `status` from the HTTP code,
+  and branch on `status == 507` instead of on message text. Keep the existing behaviour: on 507 push,
+  compact the history once and retry the covered events; if compaction does not help, surface the error.
+- Handle `429` explicitly: parse `Retry-After` (whole seconds), surface a friendly message that includes
+  the wait ("Too many attempts. Try again in N minutes."), and for **sign-in** do not retry
+  automatically — return control to the UI. For ordinary sync requests, retry at most twice with the
+  server's `Retry-After` honoured (capped at 60 s) plus jitter.
+- Retry `408` and `502`/`503`/`504` at most twice with exponential backoff plus jitter (base 1 s, cap 8 s).
+- Never retry non-idempotent calls blindly: `POST /v1/accounts` and `POST /v1/sessions` must not be
+  retried on ambiguous failures (timeout, no response). `POST /v1/events` may be retried **only** with
+  the same event IDs — the server is idempotent per event ID — which is already how `pushPending` works.
+- Treat any `3xx` as an error; keep `instanceFollowRedirects = false` in `integrations/Http.kt` and add a
+  unit test asserting a redirect response becomes a `CloudSyncException`, never a silent host change.
+
+**2. `sync/CloudSyncService.kt` — registration must never strand the user**
+
+- In `createAccount`, if the request fails **after** the account may have been created (timeout, no
+  response, `408`), do not present the error as "wrong password". The account may exist with a recovery
+  key the app never received. Return a message that offers both paths: sign in (the app can still adopt a
+  new key on the empty-account path in `sync()`) or try another email.
+- On `409`, make the message actionable: "That email already has an account on this server. Sign in
+  instead." and make sure the UI can switch to sign-in with the email prefilled.
+- Never persist a token or key before `acceptAccount` validates that `accountId` and `token` are present
+  (already true — add a test that locks it in).
+
+**3. Backup exclusions and secret storage — verify and pin with tests**
+
+- Confirm `soundtrail_secrets.xml`, `soundtrail_cloud_sync.xml`, `soundtrail_google_auth.xml`,
+  `soundtrail_youtube.xml`, `soundtrail_settings.xml`, `audio/`, and `managed-backups/` remain excluded in
+  **both** `res/xml/backup_rules.xml` and `res/xml/data_extraction_rules.xml` (cloud-backup and
+  device-transfer blocks). Adding a new preference file that can hold a credential requires adding an
+  exclude in both files — state this in a comment.
+- Add a JVM unit test (or a Robolectric-free XML assertion test if that is the existing pattern) that
+  fails if a file containing `token`, `secret`, `password`, or `recovery` in its name is ever included
+  rather than excluded.
+- Confirm `SecretStore` continues to use Keystore-backed encryption with no plaintext fallback, and that
+  `disconnect()` / `deleteAccount()` remove the token **and** the recovery key.
+
+**4. Never log credential material**
+
+- Audit for `Log.`/`println` of: `Authorization` headers, request/response bodies of `/v1/sessions` and
+  `/v1/accounts`, tokens, recovery keys, and the plaintext of any sync payload. Use `if (BuildConfig.DEBUG)`
+  guards for anything diagnostic and redact headers as `Bearer ***`.
+- Add a test or a lint-style check that `httpRequest` never logs its `authorization` argument.
+
+**5. Cleartext traffic is scoped in code, not just in the XML**
+
+`res/xml/network_security_config.xml` sets `cleartextTrafficPermitted="true"` for **all** hosts because a
+self-hosted Jellyfin server may be plain HTTP on the LAN. Keep that, and add a small helper (e.g.
+`integrations/EndpointPolicy.kt`) with a single rule that every **non-Jellyfin** integration — sync
+server, Spotify, SoundCloud, YouTube, AudioDB, mood AI, any user-entered URL — must use `https://`, and
+that `http://` is allowed only for Jellyfin. Add unit tests for: sync server accepts `https://…`, rejects
+`http://…`, rejects `https://user:pass@host`, rejects `..` path segments (already implemented in
+`normalizeServer` — keep the tests), and Jellyfin still accepts `http://192.168.1.20:8096`.
+
+**6. Recovery key display hardening**
+
+- The screen that shows the recovery key (`recoveryKeyForDisplay()`) must set `FLAG_SECURE` while the key
+  is visible, so it cannot be screenshotted or appear in the recents thumbnail, and must clear the flag
+  when leaving.
+- Copying the key must mark the clipboard entry sensitive:
+  `ClipDescription.EXTRA_IS_SENSITIVE = true` (API 33+) with a graceful fallback, and clear the clip after
+  a short timeout if the platform allows.
+- Require the user to reauthenticate (BiometricPrompt with device-credential fallback) before re-displaying
+  a stored key; show it once at account creation as today.
+
+**7. Detect a rolled-back server history instead of trusting it**
+
+- The pull path already validates cursor ordering and snapshot consistency. Add one more check: persist
+  the highest `latestSequence` seen for the current `owner_account_id` + `owner_server` pair, and if a
+  later response reports a **lower** `latestSequence` than that, do not silently continue. Server restores
+  from backup are legitimate, so present it as a warning — "This server's history is older than this
+  device's last sync (it may have been restored from a backup)" — and allow the user to continue, which
+  re-pushes the local journal (event IDs make the re-push idempotent).
+
+**8. Respect the server's input limits before sending**
+
+- Assert locally, before upload, that each batch has at most **100** events
+  (`PUSH_BATCH_SIZE` already caps this — enforce it with a `require`), each `iv` decodes to exactly 12
+  bytes, each ciphertext stays under **1 MiB**, and a snapshot stays under **8 MiB**. A local failure
+  message beats a server `400`/`413`.
+
+### Do not
+
+- Do **not** add certificate pinning, a custom `TrustManager`, or a bundled CA. Self-hosted users rotate
+  certificates and pinning would brick their installs; correctness here is "system trust store only,
+  HTTPS enforced for everything but Jellyfin", which the network security config already expresses.
+- Do **not** disable `instanceFollowRedirects = false`, allow user-installed CAs, or lower the
+  `useCleartextTraffic` scope in the XML in a way that breaks plain-HTTP Jellyfin.
+- Do **not** change payload encryption (`SyncCrypto`), the sync protocol, or the recovery-key format. The
+  server changes are transport/credential hardening only.
+
+### Acceptance criteria
+
+1. `./gradlew test` passes, including the new tests, and no existing test is weakened.
+2. `./gradlew :app:assembleRelease` succeeds on both the `minSdk` and latest SDK configurations.
+3. Manual/unit evidence in the PR body for each numbered item above: the code path, the user-visible
+   message for 429/507/408/409, and the test name that proves it.
+4. No new third-party dependencies.
+5. A short section in the PR body titled "Client ↔ server contract" listing the status codes now handled
+   and their messages, so the server side can be reviewed against it.
